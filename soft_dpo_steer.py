@@ -30,7 +30,7 @@ def set_seed(seed: int = 42):
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
 
 
-def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, use_bayes: bool = False, output_dir: str = "checkpoints/soft_dpo_steer", base_model: str = "3b", dataset: str = "helpsteer3", batch_size: int = 5):
+def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, use_bayes: bool = False, output_dir: str = "checkpoints/soft_dpo_steer", base_model: str = "3b", dataset: str = "helpsteer3", batch_size: int = 5, lr: float = 2e-5, beta: float = 0.2):
     """
     Soft-train + hard-validation.
     seed: для воспроизводимости; тот же seed, что в hard_dpo_steer (по умолчанию 42), даёт совпадающие начальные метрики на val.
@@ -79,8 +79,8 @@ def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, 
         mode=mode,
         epochs=epochs,
         batch_size=batch_size,
-        lr=2e-5,
-        beta=0.2,
+        lr=lr,
+        beta=beta,
         alpha=alpha,
         output_dir=output_dir,
         num_training_steps_override=num_steps_override,
@@ -106,5 +106,7 @@ if __name__ == "__main__":
     parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b (Qwen2.5-3B-Instruct) или 7b (Qwen2.5-7B-Instruct). По умолчанию: 3b.")
     parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Датасет: helpsteer3 или ultrafeedback_binarized (soft с голосами 0/1).")
     parser.add_argument("--batch-size", "-b", type=int, default=5, help="Размер батча для train и validation (по умолчанию: 5).")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
+    parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
     args = parser.parse_args()
-    main(resume_from=args.resume, seed=args.seed, alpha=args.alpha, use_bayes=args.use_bayes, output_dir=args.output_dir, base_model=args.base_model, dataset=args.dataset, batch_size=args.batch_size)
+    main(resume_from=args.resume, seed=args.seed, alpha=args.alpha, use_bayes=args.use_bayes, output_dir=args.output_dir, base_model=args.base_model, dataset=args.dataset, batch_size=args.batch_size, lr=args.lr, beta=args.beta)
