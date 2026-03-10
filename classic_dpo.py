@@ -1,0 +1,265 @@
+# -*- coding: utf-8 -*-
+"""
+Классический DPO через TRL (DPOTrainer). Те же входные параметры, что у hard_dpo_steer.
+На валидации логируются те же метрики: NLL, acc, KL (и DPO loss), как в hard_dpo_steer.
+"""
+import os
+import random
+import sys
+from typing import Optional
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from transformers import TrainerCallback
+from trl import DPOConfig, DPOTrainer
+from tqdm import tqdm
+
+from utils.config import BASE_MODEL_CHOICES, MAX_FULL_LEN, MAX_PROMPT_LEN
+from utils.datasets import (
+    build_dpo_datasets,
+    build_dpo_datasets_ultrafeedback,
+)
+from utils.loss import hard_dpo_loss
+from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
+from utils.models import load_models_and_tokenizer
+from utils.training import collate_fn_hard
+
+
+# ======================
+# main
+# ======================
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
+
+
+class DPOValidationMetricsCallback(TrainerCallback):
+    """После каждой эпохи валидации пишет в log те же метрики, что и hard_dpo_steer: NLL, acc, KL, DPO loss."""
+
+    def __init__(self, val_ds, tokenizer, ref_model, device: str, log_fn, beta: float, eval_batch_size: int = 2):
+        self.val_ds = val_ds
+        self.tokenizer = tokenizer
+        self.ref_model = ref_model
+        self.device = device
+        self.log_fn = log_fn
+        self.beta = beta
+        self.eval_batch_size = eval_batch_size
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+        val_loader = DataLoader(
+            self.val_ds,
+            batch_size=self.eval_batch_size,
+            shuffle=False,
+            collate_fn=collate_fn_hard,
+        )
+        model.eval()
+        if self.ref_model is not None:
+            self.ref_model.eval()
+        val_dpo_sum = 0.0
+        val_kl_sum = 0.0
+        val_n = 0
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="val DPO metrics", leave=False):
+                loss, kl_b = hard_dpo_loss(
+                    batch, self.tokenizer, model, self.ref_model, self.device, beta=self.beta
+                )
+                n = len(batch["prompt"])
+                val_dpo_sum += loss.item() * n
+                val_kl_sum += kl_b * n
+                val_n += n
+        val_dpo = val_dpo_sum / max(1, val_n)
+        val_kl = val_kl_sum / max(1, val_n)
+        val_nll = eval_pairwise_nll(
+            val_loader, self.tokenizer, model, self.device,
+            beta=1.0, max_prompt_len=MAX_PROMPT_LEN, max_full_len=MAX_FULL_LEN,
+            desc="val pairwise NLL",
+        )
+        val_acc = eval_pairwise_accuracy(
+            val_loader, self.tokenizer, model, self.device,
+            max_prompt_len=MAX_PROMPT_LEN, max_full_len=MAX_FULL_LEN,
+            desc="val pairwise acc",
+        )
+        epoch = int(state.epoch) if state.epoch is not None else 1
+        self.log_fn(f"=== Epoch {epoch} (validation) ===")
+        self.log_fn(f"validation DPO loss   : {val_dpo:.4f}")
+        self.log_fn(f"validation KL(π||ref) : {val_kl:.4f}")
+        self.log_fn(f"validation pair NLL   : {val_nll:.4f}")
+        self.log_fn(f"validation pair acc   : {val_acc:.4f}")
+
+
+def main(
+    resume_from: Optional[str] = None,
+    seed: int = 42,
+    output_dir: str = "checkpoints/classic_dpo",
+    dataset: str = "helpsteer3",
+    base_model: str = "3b",
+    batch_size: int = 8,
+    lr: float = 2e-5,
+    beta: float = 0.2,
+):
+    """
+    resume_from: путь к чекпоинту для продолжения обучения.
+    seed, output_dir, dataset, base_model, batch_size, lr, beta — по смыслу как в hard_dpo_steer.
+    Обучение — классический DPO из библиотеки TRL (DPOTrainer).
+    """
+    if dataset not in DATASET_CHOICES:
+        raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
+    set_seed(seed)
+    if dataset == "helpsteer3":
+        print("Загружаю HelpSteer3-Preference...")
+        train_ds, val_ds = build_dpo_datasets()
+    else:
+        print("Загружаю UltraFeedback Binarized...")
+        train_ds, val_ds = build_dpo_datasets_ultrafeedback()
+    model_name = BASE_MODEL_CHOICES[base_model]
+    print(f"Model: {model_name}, Dataset: {dataset}, train size: {len(train_ds)}, val size: {len(val_ds)}")
+    if resume_from:
+        print(f"Загружаю модель из чекпоинта: {resume_from} (база {model_name})")
+    else:
+        print(f"Загружаю модель и токенайзер: {model_name} (LoRA)")
+    tokenizer, policy_model, ref_model, device = load_models_and_tokenizer(
+        model_name, use_lora=True, lora_r=16, lora_alpha=32, resume_from=resume_from
+    )
+
+    policy_model.config.use_cache = False
+    if ref_model is not None:
+        ref_model.config.use_cache = False
+
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "train.log")
+
+    def log_fn(msg: str) -> None:
+        print(msg, flush=True, file=sys.stderr)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    training_args = DPOConfig(
+        output_dir=output_dir,
+        num_train_epochs=8,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=3,
+        per_device_eval_batch_size=2,
+        learning_rate=lr,
+        logging_steps=10,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+        bf16=torch.cuda.is_bf16_supported(),
+        fp16=not torch.cuda.is_bf16_supported() and torch.cuda.is_available(),
+        gradient_checkpointing=True,
+        max_length=MAX_FULL_LEN,
+        max_prompt_length=MAX_PROMPT_LEN,
+        remove_unused_columns=False,
+        beta=beta,
+    )
+
+    log_fn("=== Classic DPO (TRL DPOTrainer) ===")
+    log_fn(f"Model: {model_name}, Dataset: {dataset}, train size: {len(train_ds)}, val size: {len(val_ds)}")
+    log_fn(f"beta={beta}, lr={lr}, batch_size={batch_size}, epochs=8")
+    log_fn(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}")
+
+    # Начальная валидация — те же метрики, что в hard_dpo_steer
+    val_loader_init = DataLoader(
+        val_ds,
+        batch_size=training_args.per_device_eval_batch_size,
+        shuffle=False,
+        collate_fn=collate_fn_hard,
+    )
+    policy_model.eval()
+    if ref_model is not None:
+        ref_model.eval()
+    init_dpo_sum = 0.0
+    init_kl_sum = 0.0
+    init_n = 0
+    with torch.no_grad():
+        for batch in tqdm(val_loader_init, desc="init DPO loss", leave=False):
+            loss, kl_b = hard_dpo_loss(batch, tokenizer, policy_model, ref_model, device, beta=beta)
+            n = len(batch["prompt"])
+            init_dpo_sum += loss.item() * n
+            init_kl_sum += kl_b * n
+            init_n += n
+    init_dpo = init_dpo_sum / max(1, init_n)
+    init_kl = init_kl_sum / max(1, init_n)
+    init_nll = eval_pairwise_nll(
+        val_loader_init, tokenizer, policy_model, device,
+        beta=1.0, max_prompt_len=MAX_PROMPT_LEN, max_full_len=MAX_FULL_LEN,
+        desc="init pairwise NLL",
+    )
+    init_acc = eval_pairwise_accuracy(
+        val_loader_init, tokenizer, policy_model, device,
+        max_prompt_len=MAX_PROMPT_LEN, max_full_len=MAX_FULL_LEN,
+        desc="init pairwise acc",
+    )
+    log_fn("=== Initial (before training) ===")
+    log_fn(f"validation DPO loss   : {init_dpo:.4f}")
+    log_fn(f"validation KL(π||ref) : {init_kl:.4f}")
+    log_fn(f"validation pair NLL   : {init_nll:.4f}")
+    log_fn(f"validation pair acc   : {init_acc:.4f}")
+
+    validation_callback = DPOValidationMetricsCallback(
+        val_ds=val_ds,
+        tokenizer=tokenizer,
+        ref_model=ref_model,
+        device=device,
+        log_fn=log_fn,
+        beta=beta,
+        eval_batch_size=training_args.per_device_eval_batch_size,
+    )
+
+    trainer = DPOTrainer(
+        model=policy_model,
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        processing_class=tokenizer,
+        callbacks=[validation_callback],
+    )
+
+    trainer.train()
+
+    best_ckpt = os.path.join(output_dir, "best")
+    os.makedirs(best_ckpt, exist_ok=True)
+    trainer.save_model(best_ckpt)
+    tokenizer.save_pretrained(best_ckpt)
+    log_fn(f"Checkpoint сохранён: {best_ckpt}")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Классический DPO (TRL) на HelpSteer3 / UltraFeedback")
+    parser.add_argument(
+        "--resume", "-r",
+        type=str,
+        default=None,
+        help="Путь к чекпоинту для продолжения обучения (например checkpoints/classic_dpo/best)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Seed для воспроизводимости (по умолчанию 42)")
+    parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/classic_dpo", help="Папка для чекпоинтов и train.log")
+    parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Датасет: helpsteer3 или ultrafeedback_binarized")
+    parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b или 7b.")
+    parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
+    parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    args = parser.parse_args()
+    main(
+        resume_from=args.resume,
+        seed=args.seed,
+        output_dir=args.output_dir,
+        dataset=args.dataset,
+        base_model=args.base_model,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        beta=args.beta,
+    )
