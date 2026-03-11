@@ -3,6 +3,7 @@
 Загрузка и преобразование датасетов для DPO / soft-DPO.
 HelpSteer3 (preference), UltraFeedback Binarized.
 """
+import random
 from typing import List, Dict, Any, Optional
 
 from datasets import load_dataset, Dataset
@@ -102,11 +103,14 @@ def build_dpo_datasets_ultrafeedback():
 
 # ---------- UltraFeedback Binarized: soft DPO (голоса 0/1) ----------
 
-def extract_pair_soft_ultrafeedback(example: Dict[str, Any], alpha: float = 1.0) -> Optional[Dict[str, Any]]:
+def extract_pair_soft_ultrafeedback(
+    example: Dict[str, Any], alpha: float = 1.0, swap: bool = False
+) -> Optional[Dict[str, Any]]:
     """
     Один сэмпл UltraFeedback Binarized → {prompt, resp1, resp2, p, p_bayes}.
-    Формат как в extract_pair_soft: resp1=chosen, resp2=rejected, голоса за (resp1, resp2) = (1, 0),
-    т.е. n=1, k=0 (голоса за resp2) → p=0, p_bayes = α/(2α+1).
+    Как в HelpSteer3 soft: порядок resp1/resp2 может быть (chosen, rejected) или (rejected, chosen),
+    «кто лучше» кодируется в p (0 = лучше resp1, 1 = лучше resp2).
+    swap=True → resp1=rejected, resp2=chosen, p=1; swap=False → resp1=chosen, resp2=rejected, p=0.
     """
     prompt = example["prompt"] if isinstance(example["prompt"], str) else example["prompt"].strip()
     chosen = _ultrafeedback_message_to_response(example["chosen"])
@@ -114,29 +118,40 @@ def extract_pair_soft_ultrafeedback(example: Dict[str, Any], alpha: float = 1.0)
     if not chosen or not rejected:
         return None
     n = 1
-    k = 0.0  # голоса за resp2 (rejected) = 0, за resp1 (chosen) = 1
+    if swap:
+        resp1, resp2 = rejected, chosen
+        k = 1.0  # голоса за resp2 (chosen)
+    else:
+        resp1, resp2 = chosen, rejected
+        k = 0.0  # голоса за resp2 (rejected)
     p = k / n
     p_bayes = (alpha + k) / (2.0 * alpha + n)
     return {
         "prompt": prompt,
-        "resp1": chosen,
-        "resp2": rejected,
+        "resp1": resp1,
+        "resp2": resp2,
         "p": p,
         "p_bayes": p_bayes,
     }
 
 
-def build_ultrafeedback_soft_datasets(alpha: float = 1.0):
+def build_ultrafeedback_soft_datasets(alpha: float = 1.0, seed: int = 42):
     """
-    UltraFeedback Binarized для soft-DPO: тот же формат, что и build_helpsteer3_soft_datasets
-    (prompt, resp1, resp2, p, p_bayes), но голоса всегда (1, 0) — т.е. p=0, p_bayes=α/(2α+1).
+    UltraFeedback Binarized для soft-DPO: как HelpSteer3 soft — порядок resp1/resp2 случайный
+    (chosen то на первом, то на втором месте), «кто лучше» кодируется в p (0 или 1).
     Возвращает: train_soft_ds, val_hard_ds, hard_train_size.
     """
     ds = load_dataset("HuggingFaceH4/ultrafeedback_binarized")
     train_raw = ds["train_prefs"]
     val_raw = ds["test_prefs"]
 
-    train_soft_processed = [out for ex in train_raw if (out := extract_pair_soft_ultrafeedback(ex, alpha=alpha)) is not None]
+    rng = random.Random(seed)
+    train_soft_processed = []
+    for ex in train_raw:
+        swap = rng.random() < 0.5
+        out = extract_pair_soft_ultrafeedback(ex, alpha=alpha, swap=swap)
+        if out is not None:
+            train_soft_processed.append(out)
     train_soft_ds = Dataset.from_list(train_soft_processed)
 
     val_processed = []

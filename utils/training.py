@@ -11,6 +11,7 @@ from datasets import Dataset
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 
+from utils.config import MAX_FULL_LEN, MAX_PROMPT_LEN
 from utils.loss import hard_dpo_loss, soft_dpo_loss
 from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
 
@@ -157,6 +158,7 @@ def train_dpo(
     log_msg(f"=== {mode_label} ===")
     log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
     log_msg(f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}")
+    log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}")
 
     # Начальная валидация (hard)
     policy_model.eval()
