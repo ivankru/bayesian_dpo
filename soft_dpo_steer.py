@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import random
 import sys
 from typing import Optional
 
-import numpy as np
 import torch
 
 from utils.config import BASE_MODEL_CHOICES
+from utils.seed import set_seed
 from utils.datasets import build_helpsteer3_soft_datasets, build_ultrafeedback_soft_datasets
 from utils.models import load_models_and_tokenizer
 from utils.training import train_dpo
@@ -16,16 +15,6 @@ from utils.training import train_dpo
 # ======================
 # main
 # ======================
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
 

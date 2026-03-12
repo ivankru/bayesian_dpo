@@ -4,11 +4,9 @@
 На валидации логируются те же метрики: NLL, acc, KL (и DPO loss), как в hard_dpo_steer.
 """
 import os
-import random
 import sys
 from typing import Optional
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from transformers import TrainerCallback
@@ -16,6 +14,7 @@ from trl import DPOConfig, DPOTrainer
 from tqdm import tqdm
 
 from utils.config import BASE_MODEL_CHOICES, MAX_FULL_LEN, MAX_PROMPT_LEN
+from utils.seed import set_seed
 from utils.datasets import (
     build_dpo_datasets,
     build_dpo_datasets_ultrafeedback,
@@ -29,16 +28,6 @@ from utils.training import collate_fn_hard
 # ======================
 # main
 # ======================
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
 

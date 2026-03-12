@@ -176,15 +176,20 @@ def extract_pair_soft(example: Dict[str, Any], alpha: float = 1.0) -> Dict[str, 
     prompt = context_to_prompt(example["context"])
     a = example["response1"]
     b = example["response2"]
-    pref = example["overall_preference"]
+    
+    #pref = example["overall_preference"]
+        # n = max(1, len(example.get("individual_preference", [])))
+    # if pref < 0:
+    #     k = 0.0
+    # elif pref > 0:
+    #     k = float(n)
+    # else:
+    #     k = n / 2.0
 
-    n = max(1, len(example.get("individual_preference", [])))
-    if pref < 0:
-        k = 0.0
-    elif pref > 0:
-        k = float(n)
-    else:
-        k = n / 2.0
+    votes = example.get("individual_preference", [])
+    n = max(1, len(votes))
+    # Считаем реальные голоса за response2 (score > 0 в HelpSteer3 = response2 лучше)
+    k = sum(1.0 for v in votes if v.get("score", 0) > 0)
 
     p = k / n
     p_bayes = (alpha + k) / (2.0 * alpha + n)
