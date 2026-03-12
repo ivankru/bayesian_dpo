@@ -7,7 +7,7 @@ import torch
 
 from utils.config import BASE_MODEL_CHOICES
 from utils.seed import set_seed
-from utils.datasets import build_helpsteer3_soft_datasets, build_ultrafeedback_soft_datasets
+from utils.datasets import build_helpsteer3_soft_datasets, build_ultrafeedback_soft_datasets, build_openbmb_soft_datasets
 from utils.models import load_models_and_tokenizer
 from utils.training import train_dpo
 
@@ -16,7 +16,7 @@ from utils.training import train_dpo
 # main
 # ======================
 
-DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
+DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "openbmb")
 
 
 def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, use_bayes: bool = False, output_dir: str = "checkpoints/soft_dpo_steer", base_model: str = "3b", dataset: str = "helpsteer3", batch_size: int = 5, lr: float = 2e-5, beta: float = 0.2):
@@ -26,7 +26,7 @@ def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, 
     alpha: параметр бета-приора для p_bayes (по умолчанию 1.0).
     use_bayes: если True, в loss используется p_bayes, иначе p (по умолчанию).
     base_model: "3b" (Qwen2.5-3B) или "7b" (Qwen2.5-7B).
-    dataset: "helpsteer3" | "ultrafeedback_binarized" — для binarized выдаётся soft-формат с голосами (0, 1) или (1, 0).
+    dataset: "helpsteer3" | "ultrafeedback_binarized" | "openbmb" — для binarized/openbmb выдаётся soft-формат.
     batch_size: размер батча для train и validation.
     """
     if dataset not in DATASET_CHOICES:
@@ -36,9 +36,12 @@ def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, 
     if dataset == "helpsteer3":
         print("Загружаю HelpSteer3-Preference...")
         train_soft_ds, val_hard_ds, hard_train_size = build_helpsteer3_soft_datasets(alpha=alpha)
-    else:
+    elif dataset == "ultrafeedback_binarized":
         print("Загружаю UltraFeedback Binarized (soft: голоса 0/1)...")
-        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(alpha=alpha)
+        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(alpha=alpha, seed=seed)
+    else:  # openbmb
+        print("Загружаю openbmb/UltraFeedback (soft) + val ultrafeedback_binarized...")
+        train_soft_ds, val_hard_ds, hard_train_size = build_openbmb_soft_datasets(alpha=alpha, seed=seed)
     prob_type = "p_bayes" if use_bayes else "p"
     print(f"Model: {model_name}, Dataset: {dataset}")
     print(f"Train soft size: {len(train_soft_ds)}, val hard size: {len(val_hard_ds)}, hard train size: {hard_train_size}, alpha={alpha}, target_prob={prob_type}")
@@ -93,7 +96,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-bayes", action="store_true", help="Использовать p_bayes вместо p в качестве целевой вероятности (по умолчанию: p)")
     parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/soft_dpo_steer", help="Папка для чекпоинтов и train.log (для разных запусков задавайте разные папки)")
     parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b (Qwen2.5-3B-Instruct) или 7b (Qwen2.5-7B-Instruct). По умолчанию: 3b.")
-    parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Датасет: helpsteer3 или ultrafeedback_binarized (soft с голосами 0/1).")
+    parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Датасет: helpsteer3, ultrafeedback_binarized или openbmb (soft).")
     parser.add_argument("--batch-size", "-b", type=int, default=5, help="Размер батча для train и validation (по умолчанию: 5).")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
