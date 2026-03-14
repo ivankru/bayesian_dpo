@@ -37,11 +37,11 @@ def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, 
         print("Загружаю HelpSteer3-Preference...")
         train_soft_ds, val_hard_ds, hard_train_size = build_helpsteer3_soft_datasets(alpha=alpha)
     elif dataset == "ultrafeedback_binarized":
-        print("Загружаю UltraFeedback Binarized (soft: голоса 0/1)...")
-        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(alpha=alpha, seed=seed)
+        print("Загружаю UltraFeedback Binarized (soft)...")
+        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(alpha=alpha)
     else:  # openbmb
         print("Загружаю openbmb/UltraFeedback (soft) + val ultrafeedback_binarized...")
-        train_soft_ds, val_hard_ds, hard_train_size = build_openbmb_soft_datasets(alpha=alpha, seed=seed)
+        train_soft_ds, val_hard_ds, hard_train_size = build_openbmb_soft_datasets(alpha=alpha)
     prob_type = "p_bayes" if use_bayes else "p"
     print(f"Model: {model_name}, Dataset: {dataset}")
     print(f"Train soft size: {len(train_soft_ds)}, val hard size: {len(val_hard_ds)}, hard train size: {hard_train_size}, alpha={alpha}, target_prob={prob_type}")
@@ -92,13 +92,13 @@ if __name__ == "__main__":
         help="Путь к чекпоинту для продолжения обучения (например checkpoints/soft_dpo_steer/best)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed для воспроизводимости (должен совпадать с hard_dpo_steer для сравнения)")
-    parser.add_argument("--alpha", type=float, default=0.4, help="Параметр бета-приора для p_bayes; имеет смысл только при --use-bayes (по умолчанию 1.0)")
+    parser.add_argument("--alpha", type=float, default=0.2, help="Параметр бета-приора для p_bayes; имеет смысл только при --use-bayes (по умолчанию 1.0)")
     parser.add_argument("--use-bayes", action="store_true", help="Использовать p_bayes вместо p в качестве целевой вероятности (по умолчанию: p)")
     parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/soft_dpo_steer", help="Папка для чекпоинтов и train.log (для разных запусков задавайте разные папки)")
     parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b (Qwen2.5-3B-Instruct) или 7b (Qwen2.5-7B-Instruct). По умолчанию: 3b.")
     parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Датасет: helpsteer3, ultrafeedback_binarized или openbmb (soft).")
-    parser.add_argument("--batch-size", "-b", type=int, default=5, help="Размер батча для train и validation (по умолчанию: 5).")
-    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
-    parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 5).")
+    parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate (по умолчанию: 2e-5).")
+    parser.add_argument("--beta", type=float, default=0.3, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
     args = parser.parse_args()
     main(resume_from=args.resume, seed=args.seed, alpha=args.alpha, use_bayes=args.use_bayes, output_dir=args.output_dir, base_model=args.base_model, dataset=args.dataset, batch_size=args.batch_size, lr=args.lr, beta=args.beta)
