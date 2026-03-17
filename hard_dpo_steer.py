@@ -21,7 +21,7 @@ from utils.training import train_dpo
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
 
 
-def main(resume_from: Optional[str] = None, seed: int = 42, output_dir: str = "checkpoints/hard_dpo_steer", dataset: str = "helpsteer3", base_model: str = "3b", batch_size: int = 8, lr: float = 2e-5, beta: float = 0.2):
+def main(resume_from: Optional[str] = None, seed: int = 42, output_dir: str = "checkpoints/hard_dpo_steer", dataset: str = "helpsteer3", base_model: str = "3b", batch_size: int = 8, lr: float = 2e-5, beta: float = 0.2, epochs: int = 8):
     """
     resume_from: путь к чекпоинту (например "checkpoints/hard_dpo_steer/best").
     Если задан, policy и tokenizer загружаются из чекпоинта, обучение продолжается с этих весов.
@@ -62,7 +62,7 @@ def main(resume_from: Optional[str] = None, seed: int = 42, output_dir: str = "c
         ref_model,
         device,
         mode="hard",
-        epochs=8,
+        epochs=epochs,
         batch_size=batch_size,
         lr=lr,
         beta=beta,
@@ -89,5 +89,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    parser.add_argument("--epochs", "-e", type=int, default=8, help="Количество эпох обучения (по умолчанию: 8).")
     args = parser.parse_args()
-    main(resume_from=args.resume, seed=args.seed, output_dir=args.output_dir, dataset=args.dataset, base_model=args.base_model, batch_size=args.batch_size, lr=args.lr, beta=args.beta)
+    main(resume_from=args.resume, seed=args.seed, output_dir=args.output_dir, dataset=args.dataset, base_model=args.base_model, batch_size=args.batch_size, lr=args.lr, beta=args.beta, epochs=args.epochs)

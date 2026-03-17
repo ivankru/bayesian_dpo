@@ -19,7 +19,7 @@ from utils.training import train_dpo
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "openbmb")
 
 
-def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, use_bayes: bool = False, output_dir: str = "checkpoints/soft_dpo_steer", base_model: str = "3b", dataset: str = "helpsteer3", batch_size: int = 5, lr: float = 2e-5, beta: float = 0.2):
+def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, use_bayes: bool = False, output_dir: str = "checkpoints/soft_dpo_steer", base_model: str = "3b", dataset: str = "helpsteer3", batch_size: int = 5, lr: float = 2e-5, beta: float = 0.2, epochs: int = 8):
     """
     Soft-train + hard-validation.
     seed: для воспроизводимости; тот же seed, что в hard_dpo_steer (по умолчанию 42), даёт совпадающие начальные метрики на val.
@@ -58,7 +58,6 @@ def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, 
         print(msg, flush=True, file=sys.stderr)
 
     mode = "bayes" if use_bayes else "soft"
-    epochs = 8
     num_steps_override = epochs * ((hard_train_size + batch_size - 1) // batch_size) if hard_train_size else None
     print(f"Начинаю обучение {mode.upper()}-DPO (train {mode}, validation hard)...")
     train_dpo(
@@ -100,5 +99,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 5).")
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.3, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    parser.add_argument("--epochs", "-e", type=int, default=8, help="Количество эпох обучения (по умолчанию: 8).")
     args = parser.parse_args()
-    main(resume_from=args.resume, seed=args.seed, alpha=args.alpha, use_bayes=args.use_bayes, output_dir=args.output_dir, base_model=args.base_model, dataset=args.dataset, batch_size=args.batch_size, lr=args.lr, beta=args.beta)
+    main(resume_from=args.resume, seed=args.seed, alpha=args.alpha, use_bayes=args.use_bayes, output_dir=args.output_dir, base_model=args.base_model, dataset=args.dataset, batch_size=args.batch_size, lr=args.lr, beta=args.beta, epochs=args.epochs)

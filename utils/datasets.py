@@ -321,7 +321,9 @@ def build_helpsteer3_soft_datasets(alpha: float = 1.0):
     for ex in train_raw:
         if extract_pair_hard(ex) is not None:
             hard_train_size += 1
-        train_soft_processed.append(extract_pair_soft(ex, alpha=alpha))
+        # условие, чтобы проверить, что при одинаковом датасете soft loss аналогична hard    
+        if ex["overall_preference"] != 0:     
+            train_soft_processed.append(extract_pair_soft(ex, alpha=alpha))
     val_hard_ds = build_val_hard(val_raw)
     train_soft_ds = Dataset.from_list(train_soft_processed)
 
