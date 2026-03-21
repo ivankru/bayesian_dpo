@@ -21,7 +21,18 @@ from utils.training import train_dpo
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
 
 
-def main(resume_from: Optional[str] = None, seed: int = 42, output_dir: str = "checkpoints/hard_dpo_steer", dataset: str = "helpsteer3", base_model: str = "3b", batch_size: int = 8, lr: float = 2e-5, beta: float = 0.2, epochs: int = 8):
+def main(
+    resume_from: Optional[str] = None,
+    seed: int = 42,
+    output_dir: str = "checkpoints/hard_dpo_steer",
+    dataset: str = "helpsteer3",
+    base_model: str = "3b",
+    batch_size: int = 8,
+    lr: float = 2e-5,
+    beta: float = 0.2,
+    epochs: int = 8,
+    lambda_min: float = 1.0,
+):
     """
     resume_from: путь к чекпоинту (например "checkpoints/hard_dpo_steer/best").
     Если задан, policy и tokenizer загружаются из чекпоинта, обучение продолжается с этих весов.
@@ -30,6 +41,7 @@ def main(resume_from: Optional[str] = None, seed: int = 42, output_dir: str = "c
     dataset: "helpsteer3" | "ultrafeedback_binarized".
     base_model: "3b" (Qwen2.5-3B) или "7b" (Qwen2.5-7B).
     batch_size: размер батча для train и validation.
+    lambda_min: для режима hard не используется (оставлено для единообразия CLI с soft_dpo_steer).
     """
     if dataset not in DATASET_CHOICES:
         raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
@@ -69,12 +81,22 @@ def main(resume_from: Optional[str] = None, seed: int = 42, output_dir: str = "c
         output_dir=output_dir,
         dataset_name=dataset,
         model_name=model_name,
+        lambda_min=lambda_min,
+        seed=seed,
         log=log_fn,
     )
 
 
+def _lambda_min_type(x: str) -> float:
+    v = float(x)
+    if not 0.0 <= v <= 1.0:
+        raise ValueError(f"--lambda-min must be in [0, 1], got {v}")
+    return v
+
+
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="DPO на HelpSteer3")
     parser.add_argument(
         "--resume", "-r",
@@ -90,5 +112,22 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
     parser.add_argument("--epochs", "-e", type=int, default=8, help="Количество эпох обучения (по умолчанию: 8).")
+    parser.add_argument(
+        "--lambda-min",
+        type=_lambda_min_type,
+        default=1.0,
+        help="Для hard не влияет; единый флаг с soft_dpo_steer [0, 1] (по умолчанию: 1.0).",
+    )
     args = parser.parse_args()
-    main(resume_from=args.resume, seed=args.seed, output_dir=args.output_dir, dataset=args.dataset, base_model=args.base_model, batch_size=args.batch_size, lr=args.lr, beta=args.beta, epochs=args.epochs)
+    main(
+        resume_from=args.resume,
+        seed=args.seed,
+        output_dir=args.output_dir,
+        dataset=args.dataset,
+        base_model=args.base_model,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        beta=args.beta,
+        epochs=args.epochs,
+        lambda_min=args.lambda_min,
+    )

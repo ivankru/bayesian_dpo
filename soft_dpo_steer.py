@@ -19,7 +19,20 @@ from utils.training import train_dpo
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "openbmb")
 
 
-def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, use_bayes: bool = False, output_dir: str = "checkpoints/soft_dpo_steer", base_model: str = "3b", dataset: str = "helpsteer3", batch_size: int = 5, lr: float = 2e-5, beta: float = 0.2, epochs: int = 8):
+def main(
+    resume_from: Optional[str] = None,
+    seed: int = 42,
+    alpha: float = 1.0,
+    use_bayes: bool = False,
+    output_dir: str = "checkpoints/soft_dpo_steer",
+    base_model: str = "3b",
+    dataset: str = "helpsteer3",
+    batch_size: int = 5,
+    lr: float = 2e-5,
+    beta: float = 0.2,
+    epochs: int = 8,
+    lambda_min: float = 1.0,
+):
     """
     Soft-train + hard-validation.
     seed: для воспроизводимости; тот же seed, что в hard_dpo_steer (по умолчанию 42), даёт совпадающие начальные метрики на val.
@@ -28,6 +41,7 @@ def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, 
     base_model: "3b" (Qwen2.5-3B) или "7b" (Qwen2.5-7B).
     dataset: "helpsteer3" | "ultrafeedback_binarized" | "openbmb" — для binarized/openbmb выдаётся soft-формат.
     batch_size: размер батча для train и validation.
+    lambda_min: нижняя граница lambda_label по эпохам (смешивание меток с p_pred); 1.0 — как раньше, без смешивания.
     """
     if dataset not in DATASET_CHOICES:
         raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
@@ -77,12 +91,22 @@ def main(resume_from: Optional[str] = None, seed: int = 42, alpha: float = 1.0, 
         num_training_steps_override=num_steps_override,
         dataset_name=dataset,
         model_name=model_name,
+        lambda_min=lambda_min,
+        seed=seed,
         log=log_fn,
     )
 
 
+def _lambda_min_type(x: str) -> float:
+    v = float(x)
+    if not 0.0 <= v <= 1.0:
+        raise ValueError(f"--lambda-min must be in [0, 1], got {v}")
+    return v
+
+
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description="Soft-DPO на HelpSteer3 (train soft, validation hard)")
     parser.add_argument(
         "--resume", "-r",
@@ -100,5 +124,24 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.3, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
     parser.add_argument("--epochs", "-e", type=int, default=8, help="Количество эпох обучения (по умолчанию: 8).")
+    parser.add_argument(
+        "--lambda-min",
+        type=_lambda_min_type,
+        default=1.0,
+        help="Минимум lambda_label по эпохам [0, 1]; 1.0 = только метки из датасета (по умолчанию: 1.0).",
+    )
     args = parser.parse_args()
-    main(resume_from=args.resume, seed=args.seed, alpha=args.alpha, use_bayes=args.use_bayes, output_dir=args.output_dir, base_model=args.base_model, dataset=args.dataset, batch_size=args.batch_size, lr=args.lr, beta=args.beta, epochs=args.epochs)
+    main(
+        resume_from=args.resume,
+        seed=args.seed,
+        alpha=args.alpha,
+        use_bayes=args.use_bayes,
+        output_dir=args.output_dir,
+        base_model=args.base_model,
+        dataset=args.dataset,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        beta=args.beta,
+        epochs=args.epochs,
+        lambda_min=args.lambda_min,
+    )

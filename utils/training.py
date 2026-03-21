@@ -103,6 +103,8 @@ def train_dpo(
     num_training_steps_override: Optional[int] = None,
     dataset_name: Optional[str] = None,
     model_name: Optional[str] = None,
+    lambda_min: float = 1.0,
+    seed: int = 42,
     log=print,
 ):
     """
@@ -114,9 +116,13 @@ def train_dpo(
 
     val_ds всегда в формате chosen/rejected; валидация по hard DPO loss, NLL, accuracy.
     num_training_steps_override: для soft/bayes можно задать число шагов (например по hard train size) для выравнивания LR schedule.
+    lambda_min: для soft/bayes — нижняя граница lambda_label по эпохам (смешивание с p_pred); при 1.0 поведение как раньше.
+    seed: фиксирует shuffle train DataLoader (torch.Generator + num_workers=0).
     """
     if mode not in DPO_MODE_CHOICES:
         raise ValueError(f"mode должен быть один из {DPO_MODE_CHOICES}, получено: {mode!r}")
+    if not 0.0 <= lambda_min <= 1.0:
+        raise ValueError(f"lambda_min must be in [0, 1], got {lambda_min!r}")
 
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, "train.log")
@@ -138,17 +144,23 @@ def train_dpo(
         loss_kwargs = {"beta": beta, "use_bayes": use_bayes}
         mode_label = "Bayes DPO" if use_bayes else "Soft DPO"
 
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=train_collate,
+        num_workers=0,
+        generator=g,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn_hard,
+        num_workers=0,
     )
 
     num_training_steps = num_training_steps_override or epochs * len(train_loader)
@@ -157,7 +169,9 @@ def train_dpo(
 
     log_msg(f"=== {mode_label} ===")
     log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
-    log_msg(f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}")
+    log_msg(
+        f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, seed={seed}"
+    )
     log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}")
 
     # Начальная валидация (hard)
@@ -193,6 +207,14 @@ def train_dpo(
     global_step = 0
     best_val_nll = float("inf")
     for epoch in range(epochs):
+        if mode == "hard":
+            epoch_loss_kwargs = loss_kwargs
+        else:
+            progress_epoch = epoch / (epochs - 1) if epochs > 1 else 1.0
+            lambda_label_epoch = max(lambda_min, 1.0 - progress_epoch)
+            epoch_loss_kwargs = {**loss_kwargs, "lambda_label": lambda_label_epoch}
+            log_msg(f"Epoch {epoch + 1}/{epochs}: lambda_label={lambda_label_epoch:.6f}")
+
         global_step = train_one_epoch_dpo(
             train_loader,
             tokenizer,
@@ -205,7 +227,7 @@ def train_dpo(
             epoch,
             global_step,
             log=log_msg,
-            **loss_kwargs,
+            **epoch_loss_kwargs,
         )
 
         policy_model.eval()

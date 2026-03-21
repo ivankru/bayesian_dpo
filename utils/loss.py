@@ -109,6 +109,7 @@ def soft_dpo_loss(
     device: str,
     beta: float = 0.1,
     use_bayes: bool = False,
+    lambda_label: float = 1.0,
     **kwargs,
 ):
     """
@@ -116,13 +117,17 @@ def soft_dpo_loss(
     loss = softplus(beta * diff) - p_target * beta * diff,
     где diff = (Δ_theta - Δ_ref).
     batch: prompt, resp1, resp2, p, p_bayes.
+    lambda_label in [0, 1]: при 1.0 цель — чистые метки p_gt; иначе смешивание с sigmoid(logit).detach().
     Возвращает (loss, kl_approx).
     """
+    if not 0.0 <= lambda_label <= 1.0:
+        raise ValueError(f"lambda_label must be in [0, 1], got {lambda_label!r}")
+
     prompts = batch["prompt"]
     resp1 = batch["resp1"]
     resp2 = batch["resp2"]
     target_key = "p_bayes" if use_bayes else "p"
-    p_target = torch.as_tensor(batch[target_key], dtype=torch.float32, device=device)
+    p_gt = torch.as_tensor(batch[target_key], dtype=torch.float32, device=device)
 
     # log π_θ
     logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device)
@@ -143,6 +148,14 @@ def soft_dpo_loss(
     logit = beta * diff
     # if _SOFT_DPO_LOGIT_CLIP is not None:
     #     logit = logit.clamp(-_SOFT_DPO_LOGIT_CLIP, _SOFT_DPO_LOGIT_CLIP)
+
+    if lambda_label == 1.0:
+        p_target = p_gt
+    else:
+        p_pred = torch.sigmoid(logit).detach()
+        p_gt_m = p_gt.to(dtype=logit.dtype)
+        lam = logit.new_tensor(lambda_label)
+        p_target = lam * p_gt_m + (1.0 - lam) * p_pred
 
     # Формула (9): softplus - q * logit
     # softplus(x) = log(1 + exp(x)) — устойчивый примитив
