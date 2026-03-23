@@ -10,6 +10,8 @@
 # Исключение: папка utils (содержит .py)
 !utils/
 !utils/*.py
+!utils/datasets/
+!utils/datasets/*.py
 !utils/seed.py
 
 # Исключение: сам .gitignore должен быть в репозитории

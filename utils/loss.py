@@ -19,8 +19,24 @@ _BCE_EPS = 1e-11
 _SOFT_DPO_LOGIT_CLIP = 20.0
 
 
-def _logps(model, tokenizer, prompts, responses, device):
-    return get_logps(model, tokenizer, prompts, responses, device, MAX_PROMPT_LEN, MAX_FULL_LEN)
+def _logps(
+    model,
+    tokenizer,
+    prompts,
+    responses,
+    device,
+    use_chat_template: bool = False,
+):
+    return get_logps(
+        model,
+        tokenizer,
+        prompts,
+        responses,
+        device,
+        MAX_PROMPT_LEN,
+        MAX_FULL_LEN,
+        use_chat_template=use_chat_template,
+    )
 
 
 def hard_dpo_loss(
@@ -30,6 +46,7 @@ def hard_dpo_loss(
     ref_model,
     device: str,
     beta: float = 0.1,
+    use_chat_template: bool = False,
     **kwargs,
 ):
     """
@@ -40,11 +57,11 @@ def hard_dpo_loss(
     chosen = batch["chosen"]
     rejected = batch["rejected"]
 
-    logp_c = _logps(policy_model, tokenizer, prompts, chosen, device)
-    logp_r = _logps(policy_model, tokenizer, prompts, rejected, device)
+    logp_c = _logps(policy_model, tokenizer, prompts, chosen, device, use_chat_template)
+    logp_r = _logps(policy_model, tokenizer, prompts, rejected, device, use_chat_template)
     with torch.no_grad():
-        logp_c_ref = _logps(ref_model, tokenizer, prompts, chosen, device)
-        logp_r_ref = _logps(ref_model, tokenizer, prompts, rejected, device)
+        logp_c_ref = _logps(ref_model, tokenizer, prompts, chosen, device, use_chat_template)
+        logp_r_ref = _logps(ref_model, tokenizer, prompts, rejected, device, use_chat_template)
 
     diff = (logp_c - logp_r) - (logp_c_ref - logp_r_ref)
     loss = -F.logsigmoid(beta * diff).mean()
@@ -63,6 +80,7 @@ def soft_dpo_loss_bce(
     device: str,
     beta: float = 0.1,
     use_bayes: bool = False,
+    use_chat_template: bool = False,
     **kwargs,
 ):
     """
@@ -76,11 +94,11 @@ def soft_dpo_loss_bce(
     target_key = "p_bayes" if use_bayes else "p"
     p_target = torch.tensor(batch[target_key], dtype=torch.float32, device=device)
 
-    logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device)
-    logp_2 = _logps(policy_model, tokenizer, prompts, resp2, device)
+    logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device, use_chat_template)
+    logp_2 = _logps(policy_model, tokenizer, prompts, resp2, device, use_chat_template)
     with torch.no_grad():
-        logp_1_ref = _logps(ref_model, tokenizer, prompts, resp1, device)
-        logp_2_ref = _logps(ref_model, tokenizer, prompts, resp2, device)
+        logp_1_ref = _logps(ref_model, tokenizer, prompts, resp1, device, use_chat_template)
+        logp_2_ref = _logps(ref_model, tokenizer, prompts, resp2, device, use_chat_template)
 
     diff = (logp_2 - logp_1) - (logp_2_ref - logp_1_ref)
     # Ограничиваем logit, чтобы sigmoid не уходил в 0/1 и не было взрыва BCE и градиентов
@@ -110,6 +128,7 @@ def soft_dpo_loss(
     beta: float = 0.1,
     use_bayes: bool = False,
     lambda_label: float = 1.0,
+    use_chat_template: bool = False,
     **kwargs,
 ):
     """
@@ -130,13 +149,13 @@ def soft_dpo_loss(
     p_gt = torch.as_tensor(batch[target_key], dtype=torch.float32, device=device)
 
     # log π_θ
-    logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device)
-    logp_2 = _logps(policy_model, tokenizer, prompts, resp2, device)
+    logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device, use_chat_template)
+    logp_2 = _logps(policy_model, tokenizer, prompts, resp2, device, use_chat_template)
 
     # log π_ref (без градиента)
     with torch.no_grad():
-        logp_1_ref = _logps(ref_model, tokenizer, prompts, resp1, device)
-        logp_2_ref = _logps(ref_model, tokenizer, prompts, resp2, device)
+        logp_1_ref = _logps(ref_model, tokenizer, prompts, resp1, device, use_chat_template)
+        logp_2_ref = _logps(ref_model, tokenizer, prompts, resp2, device, use_chat_template)
 
     # Δ_theta - Δ_ref (здесь порядок как в статье:
     # Δ = (logπ1 - logπ2) - (logπ1_ref - logπ2_ref))
