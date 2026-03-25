@@ -72,50 +72,50 @@ def hard_dpo_loss(
     return loss, kl_approx
 
 
-def soft_dpo_loss_bce(
-    batch,
-    tokenizer,
-    policy_model,
-    ref_model,
-    device: str,
-    beta: float = 0.1,
-    use_bayes: bool = False,
-    use_chat_template: bool = False,
-    **kwargs,
-):
-    """
-    Soft DPO: batch с полями prompt, resp1, resp2, p, p_bayes.
-    use_bayes: если True, целевая вероятность p_bayes, иначе p.
-    Возвращает (loss, kl_approx).
-    """
-    prompts = batch["prompt"]
-    resp1 = batch["resp1"]
-    resp2 = batch["resp2"]
-    target_key = "p_bayes" if use_bayes else "p"
-    p_target = torch.tensor(batch[target_key], dtype=torch.float32, device=device)
+# def soft_dpo_loss_bce(
+#     batch,
+#     tokenizer,
+#     policy_model,
+#     ref_model,
+#     device: str,
+#     beta: float = 0.1,
+#     use_bayes: bool = False,
+#     use_chat_template: bool = False,
+#     **kwargs,
+# ):
+#     """
+#     Soft DPO: batch с полями prompt, resp1, resp2, p, p_bayes.
+#     use_bayes: если True, целевая вероятность p_bayes, иначе p.
+#     Возвращает (loss, kl_approx).
+#     """
+#     prompts = batch["prompt"]
+#     resp1 = batch["resp1"]
+#     resp2 = batch["resp2"]
+#     target_key = "p_bayes" if use_bayes else "p"
+#     p_target = torch.tensor(batch[target_key], dtype=torch.float32, device=device)
 
-    logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device, use_chat_template)
-    logp_2 = _logps(policy_model, tokenizer, prompts, resp2, device, use_chat_template)
-    with torch.no_grad():
-        logp_1_ref = _logps(ref_model, tokenizer, prompts, resp1, device, use_chat_template)
-        logp_2_ref = _logps(ref_model, tokenizer, prompts, resp2, device, use_chat_template)
+#     logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device, use_chat_template)
+#     logp_2 = _logps(policy_model, tokenizer, prompts, resp2, device, use_chat_template)
+#     with torch.no_grad():
+#         logp_1_ref = _logps(ref_model, tokenizer, prompts, resp1, device, use_chat_template)
+#         logp_2_ref = _logps(ref_model, tokenizer, prompts, resp2, device, use_chat_template)
 
-    diff = (logp_2 - logp_1) - (logp_2_ref - logp_1_ref)
-    # Ограничиваем logit, чтобы sigmoid не уходил в 0/1 и не было взрыва BCE и градиентов
-    logit = beta * diff
-    #logit = logit.clamp(-_SOFT_DPO_LOGIT_CLIP, _SOFT_DPO_LOGIT_CLIP)
-    s = torch.sigmoid(logit)
-    p_target = p_target.to(dtype=s.dtype)
-    # Защита от log(0): s в (eps, 1-eps) для численной стабильности BCE
-    #s = s.clamp(_BCE_EPS, 1.0 - _BCE_EPS)
-    # BCE(s, p) = -[p*log(s) + (1-p)*log(1-s)] по элементам, затем .mean()
-    loss = -(p_target * torch.log(s + _BCE_EPS) + (1.0 - p_target) * torch.log(1.0 - s + _BCE_EPS))
-    loss = loss.mean()
-    # то же определение, что и в hard: средний log π/ref по паре ответов (может быть < 0 или большим)
-    kl_approx = 0.5 * (
-        (logp_1 - logp_1_ref).mean().item() + (logp_2 - logp_2_ref).mean().item()
-    )
-    return loss, kl_approx
+#     diff = (logp_2 - logp_1) - (logp_2_ref - logp_1_ref)
+#     # Ограничиваем logit, чтобы sigmoid не уходил в 0/1 и не было взрыва BCE и градиентов
+#     logit = beta * diff
+#     #logit = logit.clamp(-_SOFT_DPO_LOGIT_CLIP, _SOFT_DPO_LOGIT_CLIP)
+#     s = torch.sigmoid(logit)
+#     p_target = p_target.to(dtype=s.dtype)
+#     # Защита от log(0): s в (eps, 1-eps) для численной стабильности BCE
+#     #s = s.clamp(_BCE_EPS, 1.0 - _BCE_EPS)
+#     # BCE(s, p) = -[p*log(s) + (1-p)*log(1-s)] по элементам, затем .mean()
+#     loss = -(p_target * torch.log(s + _BCE_EPS) + (1.0 - p_target) * torch.log(1.0 - s + _BCE_EPS))
+#     loss = loss.mean()
+#     # то же определение, что и в hard: средний log π/ref по паре ответов (может быть < 0 или большим)
+#     kl_approx = 0.5 * (
+#         (logp_1 - logp_1_ref).mean().item() + (logp_2 - logp_2_ref).mean().item()
+#     )
+#     return loss, kl_approx
 
 
 
@@ -136,7 +136,7 @@ def soft_dpo_loss(
     loss = softplus(beta * diff) - p_target * beta * diff,
     где diff = (Δ_theta - Δ_ref).
     batch: prompt, resp1, resp2, p, p_bayes.
-    lambda_label in [0, 1]: при 1.0 цель — чистые метки p_gt; иначе смешивание с sigmoid(logit).detach().
+    lambda_label in [0, 1]: при 1.0 цель — чистые метки p_gt; иначе смешивание с p_pred_cached (учитель, посчитанный до эпохи).
     Возвращает (loss, kl_approx).
     """
     if not 0.0 <= lambda_label <= 1.0:
@@ -171,7 +171,9 @@ def soft_dpo_loss(
     if lambda_label == 1.0:
         p_target = p_gt
     else:
-        p_pred = torch.sigmoid(logit).detach()
+        p_pred = torch.as_tensor(
+            batch["p_pred_cached"], device=device, dtype=logit.dtype
+        )
         p_gt_m = p_gt.to(dtype=logit.dtype)
         lam = logit.new_tensor(lambda_label)
         p_target = lam * p_gt_m + (1.0 - lam) * p_pred
