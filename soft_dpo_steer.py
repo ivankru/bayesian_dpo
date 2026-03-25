@@ -32,6 +32,7 @@ def main(
     beta: float = 0.2,
     epochs: int = 8,
     lambda_min: float = 1.0,
+    use_chat_template: Optional[bool] = None,
 ):
     """
     Soft-train + hard-validation.
@@ -42,6 +43,7 @@ def main(
     dataset: "helpsteer3" | "ultrafeedback_binarized" | "openbmb" — для binarized/openbmb выдаётся soft-формат.
     batch_size: размер батча для train и validation.
     lambda_min: нижняя граница lambda_label по эпохам (смешивание меток с p_pred); 1.0 — как раньше, без смешивания.
+    use_chat_template: если None — False для текущих soft-датасетов; иначе явное значение для get_logps.
     """
     if dataset not in DATASET_CHOICES:
         raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
@@ -68,6 +70,9 @@ def main(
         model_name, use_lora=True, lora_r=16, lora_alpha=32, resume_from=resume_from
     )
 
+    if use_chat_template is None:
+        use_chat_template = False
+
     def log_fn(msg: str) -> None:
         print(msg, flush=True, file=sys.stderr)
 
@@ -93,6 +98,7 @@ def main(
         model_name=model_name,
         lambda_min=lambda_min,
         seed=seed,
+        use_chat_template=use_chat_template,
         log=log_fn,
     )
 
@@ -130,7 +136,23 @@ if __name__ == "__main__":
         default=1.0,
         help="Минимум lambda_label по эпохам [0, 1]; 1.0 = только метки из датасета (по умолчанию: 1.0).",
     )
+    chat_group = parser.add_mutually_exclusive_group()
+    chat_group.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="Считать log p через apply_chat_template (Qwen-Instruct).",
+    )
+    chat_group.add_argument(
+        "--no-use-chat-template",
+        action="store_true",
+        help="Считать log p как plain prompt\\nresponse (отключить chat template).",
+    )
     args = parser.parse_args()
+    use_chat_template: Optional[bool] = None
+    if args.use_chat_template:
+        use_chat_template = True
+    elif args.no_use_chat_template:
+        use_chat_template = False
     main(
         resume_from=args.resume,
         seed=args.seed,
@@ -144,4 +166,5 @@ if __name__ == "__main__":
         beta=args.beta,
         epochs=args.epochs,
         lambda_min=args.lambda_min,
+        use_chat_template=use_chat_template,
     )
