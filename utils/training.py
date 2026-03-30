@@ -3,8 +3,10 @@
 Общий цикл обучения одной эпохи для DPO и универсальная функция train_dpo (режимы hard / soft / bayes).
 """
 import os
-from typing import Any, Callable, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
+import mlflow
 import torch
 from torch.utils.data import DataLoader
 from datasets import Dataset
@@ -16,6 +18,35 @@ from utils.loss import _logps, hard_dpo_loss, soft_dpo_loss
 from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
+
+
+@contextmanager
+def _mlflow_training_context(
+    enabled: bool,
+    experiment: str,
+    run_name: Optional[str],
+    tracking_uri: Optional[str],
+    params: Dict[str, Any],
+    log_path: str,
+) -> Iterator[None]:
+    if not enabled:
+        yield
+        return
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment(experiment)
+    mlflow.start_run(run_name=run_name)
+    try:
+        to_log = {k: str(v) for k, v in params.items() if v is not None}
+        mlflow.log_params(to_log)
+        yield
+    finally:
+        if os.path.isfile(log_path):
+            try:
+                mlflow.log_artifact(log_path)
+            except OSError:
+                pass
+        mlflow.end_run()
 
 
 def collate_fn_hard(examples: List[Dict[str, Any]]) -> Dict[str, List[str]]:
@@ -109,6 +140,7 @@ def train_one_epoch_dpo(
     epoch: int,
     global_step: int,
     log=print,
+    use_mlflow: bool = False,
     **loss_kwargs: Any,
 ) -> int:
     """
@@ -135,12 +167,18 @@ def train_one_epoch_dpo(
         global_step += 1
 
         if global_step % 1000 == 0:
-            log(f"  step {global_step} lr={optimizer.param_groups[0]['lr']:.2e}")
+            lr_cur = optimizer.param_groups[0]["lr"]
+            log(f"  step {global_step} lr={lr_cur:.2e}")
+            if use_mlflow:
+                mlflow.log_metric("lr", lr_cur, step=global_step)
         if global_step % log_interval == 0:
             n = log_interval
             log(
                 f"[epoch {epoch+1}] step {global_step} train_loss={running_loss / n:.4f} kl_pi_ref={running_kl / n:.4f}"
             )
+            if use_mlflow:
+                mlflow.log_metric("train_loss", running_loss / n, step=global_step)
+                mlflow.log_metric("train_kl_pi_ref", running_kl / n, step=global_step)
             running_loss = 0.0
             running_kl = 0.0
 
@@ -168,6 +206,10 @@ def train_dpo(
     seed: int = 42,
     use_chat_template: bool = False,
     log=print,
+    use_mlflow: bool = False,
+    mlflow_experiment: str = "bayesian_dpo",
+    mlflow_run_name: Optional[str] = None,
+    mlflow_tracking_uri: Optional[str] = None,
 ):
     """
     Универсальный цикл DPO: hard, soft или bayes.
@@ -181,6 +223,7 @@ def train_dpo(
     lambda_min: для soft/bayes — нижняя граница lambda_label по эпохам (смешивание с p_pred); при 1.0 поведение как раньше.
     seed: фиксирует shuffle train DataLoader (torch.Generator + num_workers=0).
     use_chat_template: если True, get_logps использует tokenizer.apply_chat_template (Qwen-Instruct); иначе plain prompt\\nresponse.
+    use_mlflow: логировать параметры, метрики и train.log в MLflow (tracking URI из mlflow_tracking_uri или окружения по умолчанию).
     """
     if mode not in DPO_MODE_CHOICES:
         raise ValueError(f"mode должен быть один из {DPO_MODE_CHOICES}, получено: {mode!r}")
@@ -195,161 +238,81 @@ def train_dpo(
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
 
-    use_bayes = mode == "bayes"
-    if mode == "hard":
-        train_collate = collate_fn_hard
-        train_loss_fn = hard_dpo_loss
-        loss_kwargs = {"beta": beta, "use_chat_template": use_chat_template}
-        mode_label = "Hard DPO"
-    else:
-        train_collate = collate_fn_soft
-        train_loss_fn = soft_dpo_loss
-        loss_kwargs = {"beta": beta, "use_bayes": use_bayes, "use_chat_template": use_chat_template}
-        mode_label = "Bayes DPO" if use_bayes else "Soft DPO"
+    mlflow_param_dict: Dict[str, Any] = {
+        "mode": mode,
+        "beta": beta,
+        "lr": lr,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "lambda_min": lambda_min,
+        "seed": seed,
+        "dataset_name": dataset_name,
+        "model_name": model_name,
+        "output_dir": output_dir,
+        "alpha": alpha,
+        "use_chat_template": use_chat_template,
+        "num_training_steps_override": num_training_steps_override,
+    }
 
-    g = torch.Generator()
-    g.manual_seed(seed)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=train_collate,
-        num_workers=0,
-        generator=g,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn_hard,
-        num_workers=0,
-    )
-
-    num_training_steps = num_training_steps_override or epochs * len(train_loader)
-    if num_training_steps_override is not None:
-        log_msg(f"LR schedule: num_training_steps={num_training_steps} (override)")
-
-    log_msg(f"=== {mode_label} ===")
-    log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
-    log_msg(
-        f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, seed={seed}"
-    )
-    log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
-
-    # Начальная валидация (hard)
-    policy_model.eval()
-    init_dpo_sum = 0.0
-    init_kl_sum = 0.0
-    init_n = 0
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="init DPO loss", leave=False):
-            loss, kl_b = hard_dpo_loss(
-                batch,
-                tokenizer,
-                policy_model,
-                ref_model,
-                device,
-                beta=beta,
-                use_chat_template=use_chat_template,
-            )
-            n = len(batch["prompt"])
-            init_dpo_sum += loss.item() * n
-            init_kl_sum += kl_b * n
-            init_n += n
-    init_dpo = init_dpo_sum / max(1, init_n)
-    init_kl = init_kl_sum / max(1, init_n)
-    init_nll = eval_pairwise_nll(
-        val_loader,
-        tokenizer,
-        policy_model,
-        device,
-        beta=1.0,
-        use_chat_template=use_chat_template,
-        desc="init pairwise NLL",
-    )
-    init_acc = eval_pairwise_accuracy(
-        val_loader,
-        tokenizer,
-        policy_model,
-        device,
-        use_chat_template=use_chat_template,
-        desc="init pairwise acc",
-    )
-
-    log_msg("=== Initial (before training) ===")
-    log_msg(f"validation DPO loss   : {init_dpo:.4f}")
-    log_msg(f"validation KL(π||ref) : {init_kl:.4f}")
-    log_msg(f"validation pair NLL   : {init_nll:.4f}")
-    log_msg(f"validation pair acc   : {init_acc:.4f}")
-
-    optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=max(10, num_training_steps // 20),
-        num_training_steps=num_training_steps,
-    )
-
-    global_step = 0
-    best_val_nll = float("inf")
-    for epoch in range(epochs):
+    with _mlflow_training_context(
+        use_mlflow,
+        mlflow_experiment,
+        mlflow_run_name,
+        mlflow_tracking_uri,
+        mlflow_param_dict,
+        log_path,
+    ):
+        use_bayes = mode == "bayes"
         if mode == "hard":
-            epoch_loss_kwargs = loss_kwargs
+            train_collate = collate_fn_hard
+            train_loss_fn = hard_dpo_loss
+            loss_kwargs = {"beta": beta, "use_chat_template": use_chat_template}
+            mode_label = "Hard DPO"
         else:
-            # progress_epoch = epoch / (epochs - 1) if epochs > 1 else 1.0
-            # lambda_label_epoch = max(lambda_min, 1.0 - progress_epoch)
-            if epochs > 1:
-                progress_epoch = epoch / (epochs - 1)   # 0 ... 1
-            else:
-                progress_epoch = 1.0
+            train_collate = collate_fn_soft
+            train_loss_fn = soft_dpo_loss
+            loss_kwargs = {"beta": beta, "use_bayes": use_bayes, "use_chat_template": use_chat_template}
+            mode_label = "Bayes DPO" if use_bayes else "Soft DPO"
 
-            lambda_label_epoch = 1.0 - (1.0 - lambda_min) * progress_epoch
+        g = torch.Generator()
+        g.manual_seed(seed)
 
-            epoch_loss_kwargs = {**loss_kwargs, "lambda_label": lambda_label_epoch}
-            log_msg(f"Epoch {epoch + 1}/{epochs}: lambda_label={lambda_label_epoch:.6f}")
-
-            if lambda_label_epoch < 1.0:
-                train_ds = precompute_p_pred_cached(
-                    train_ds,
-                    tokenizer,
-                    policy_model,
-                    ref_model,
-                    device=device,
-                    beta=beta,
-                    use_chat_template=use_chat_template,
-                    batch_size=batch_size,
-                    collate_fn=train_collate,
-                )
-                train_loader = DataLoader(
-                    train_ds,
-                    batch_size=batch_size,
-                    shuffle=True,
-                    collate_fn=train_collate,
-                    num_workers=0,
-                    generator=g,
-                )
-
-        global_step = train_one_epoch_dpo(
-            train_loader,
-            tokenizer,
-            policy_model,
-            ref_model,
-            device,
-            train_loss_fn,
-            optimizer,
-            scheduler,
-            epoch,
-            global_step,
-            log=log_msg,
-            **epoch_loss_kwargs,
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=train_collate,
+            num_workers=0,
+            generator=g,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn_hard,
+            num_workers=0,
         )
 
+        num_training_steps = num_training_steps_override or epochs * len(train_loader)
+        if use_mlflow:
+            mlflow.log_param("num_training_steps", num_training_steps)
+        if num_training_steps_override is not None:
+            log_msg(f"LR schedule: num_training_steps={num_training_steps} (override)")
+
+        log_msg(f"=== {mode_label} ===")
+        log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
+        log_msg(
+            f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, seed={seed}"
+        )
+        log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
+
+        # Начальная валидация (hard)
         policy_model.eval()
-        val_dpo_sum = 0.0
-        val_kl_sum = 0.0
-        val_n = 0
+        init_dpo_sum = 0.0
+        init_kl_sum = 0.0
+        init_n = 0
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"val DPO ep{epoch+1}", leave=False):
+            for batch in tqdm(val_loader, desc="init DPO loss", leave=False):
                 loss, kl_b = hard_dpo_loss(
                     batch,
                     tokenizer,
@@ -360,39 +323,145 @@ def train_dpo(
                     use_chat_template=use_chat_template,
                 )
                 n = len(batch["prompt"])
-                val_dpo_sum += loss.item() * n
-                val_kl_sum += kl_b * n
-                val_n += n
-        val_dpo = val_dpo_sum / max(1, val_n)
-        val_kl = val_kl_sum / max(1, val_n)
-        val_nll = eval_pairwise_nll(
+                init_dpo_sum += loss.item() * n
+                init_kl_sum += kl_b * n
+                init_n += n
+        init_dpo = init_dpo_sum / max(1, init_n)
+        init_kl = init_kl_sum / max(1, init_n)
+        init_nll = eval_pairwise_nll(
             val_loader,
             tokenizer,
             policy_model,
             device,
             beta=1.0,
             use_chat_template=use_chat_template,
-            desc=f"val NLL ep{epoch+1}",
+            desc="init pairwise NLL",
         )
-        val_acc = eval_pairwise_accuracy(
+        init_acc = eval_pairwise_accuracy(
             val_loader,
             tokenizer,
             policy_model,
             device,
             use_chat_template=use_chat_template,
-            desc=f"val acc ep{epoch+1}",
+            desc="init pairwise acc",
         )
 
-        log_msg(f"=== Epoch {epoch+1} ===")
-        log_msg(f"validation DPO loss   : {val_dpo:.4f}")
-        log_msg(f"validation KL(π||ref) : {val_kl:.4f}")
-        log_msg(f"validation pair NLL   : {val_nll:.4f}")
-        log_msg(f"validation pair acc   : {val_acc:.4f}")
+        log_msg("=== Initial (before training) ===")
+        log_msg(f"validation DPO loss   : {init_dpo:.4f}")
+        log_msg(f"validation KL(π||ref) : {init_kl:.4f}")
+        log_msg(f"validation pair NLL   : {init_nll:.4f}")
+        log_msg(f"validation pair acc   : {init_acc:.4f}")
 
-        if val_nll < best_val_nll:
-            best_val_nll = val_nll
-            ckpt_dir = os.path.join(output_dir, "best")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            tokenizer.save_pretrained(ckpt_dir)
-            policy_model.save_pretrained(ckpt_dir)
-            log_msg(f"New best NLL {val_nll:.4f} -> checkpoint saved: {ckpt_dir}")
+        optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=max(10, num_training_steps // 20),
+            num_training_steps=num_training_steps,
+        )
+
+        global_step = 0
+        best_val_nll = float("inf")
+        for epoch in range(epochs):
+            if mode == "hard":
+                epoch_loss_kwargs = loss_kwargs
+            else:
+                # progress_epoch = epoch / (epochs - 1) if epochs > 1 else 1.0
+                # lambda_label_epoch = max(lambda_min, 1.0 - progress_epoch)
+                if epochs > 1:
+                    progress_epoch = epoch / (epochs - 1)   # 0 ... 1
+                else:
+                    progress_epoch = 1.0
+
+                lambda_label_epoch = 1.0 - (1.0 - lambda_min) * progress_epoch
+
+                epoch_loss_kwargs = {**loss_kwargs, "lambda_label": lambda_label_epoch}
+                log_msg(f"Epoch {epoch + 1}/{epochs}: lambda_label={lambda_label_epoch:.6f}")
+
+                if lambda_label_epoch < 1.0:
+                    train_ds = precompute_p_pred_cached(
+                        train_ds,
+                        tokenizer,
+                        policy_model,
+                        ref_model,
+                        device=device,
+                        beta=beta,
+                        use_chat_template=use_chat_template,
+                        batch_size=batch_size,
+                        collate_fn=train_collate,
+                    )
+                    train_loader = DataLoader(
+                        train_ds,
+                        batch_size=batch_size,
+                        shuffle=True,
+                        collate_fn=train_collate,
+                        num_workers=0,
+                        generator=g,
+                    )
+
+            global_step = train_one_epoch_dpo(
+                train_loader,
+                tokenizer,
+                policy_model,
+                ref_model,
+                device,
+                train_loss_fn,
+                optimizer,
+                scheduler,
+                epoch,
+                global_step,
+                log=log_msg,
+                **epoch_loss_kwargs,
+            )
+
+            policy_model.eval()
+            val_dpo_sum = 0.0
+            val_kl_sum = 0.0
+            val_n = 0
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc=f"val DPO ep{epoch+1}", leave=False):
+                    loss, kl_b = hard_dpo_loss(
+                        batch,
+                        tokenizer,
+                        policy_model,
+                        ref_model,
+                        device,
+                        beta=beta,
+                        use_chat_template=use_chat_template,
+                    )
+                    n = len(batch["prompt"])
+                    val_dpo_sum += loss.item() * n
+                    val_kl_sum += kl_b * n
+                    val_n += n
+            val_dpo = val_dpo_sum / max(1, val_n)
+            val_kl = val_kl_sum / max(1, val_n)
+            val_nll = eval_pairwise_nll(
+                val_loader,
+                tokenizer,
+                policy_model,
+                device,
+                beta=1.0,
+                use_chat_template=use_chat_template,
+                desc=f"val NLL ep{epoch+1}",
+            )
+            val_acc = eval_pairwise_accuracy(
+                val_loader,
+                tokenizer,
+                policy_model,
+                device,
+                use_chat_template=use_chat_template,
+                desc=f"val acc ep{epoch+1}",
+            )
+
+            log_msg(f"=== Epoch {epoch+1} ===")
+            log_msg(f"validation DPO loss   : {val_dpo:.4f}")
+            log_msg(f"validation KL(π||ref) : {val_kl:.4f}")
+            log_msg(f"validation pair NLL   : {val_nll:.4f}")
+            log_msg(f"validation pair acc   : {val_acc:.4f}")
+
+            if val_nll < best_val_nll:
+                best_val_nll = val_nll
+                ckpt_dir = os.path.join(output_dir, "best")
+                os.makedirs(ckpt_dir, exist_ok=True)
+                tokenizer.save_pretrained(ckpt_dir)
+                policy_model.save_pretrained(ckpt_dir)
+                log_msg(f"New best NLL {val_nll:.4f} -> checkpoint saved: {ckpt_dir}")

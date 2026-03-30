@@ -148,3 +148,36 @@ def build_hh_rlhf_soft_datasets(
         train_soft_ds, val_soft_ds = split["train"], split["test"]
 
     return train_soft_ds, val_soft_ds
+
+
+def build_hh_rlhf_soft_steer_datasets(alpha: float = 1.0) -> Tuple[Dataset, Dataset, int]:
+    """
+    Soft-DPO train + hard val для soft_dpo_steer (как HelpSteer / UltraFeedback).
+
+    Сплиты совпадают с build_dpo_datasets_hh_rlhf: при отдельном val — он же;
+    иначе train_test_split(test_size=0.05, seed=42) от полного train.
+
+    Возвращает: train_soft_ds, val_hard_ds, hard_train_size (len(train_soft)).
+    """
+    raw_train, raw_val = _load_pku_hh_rlhf_raw_splits()
+
+    if raw_val is not None:
+        train_soft_ds = Dataset.from_list(
+            [extract_pair_hh_soft(ex, alpha=alpha) for ex in raw_train]
+        )
+        val_hard_ds = Dataset.from_list([extract_pair_hh_hard(ex) for ex in raw_val])
+        hard_train_size = len(train_soft_ds)
+        return train_soft_ds, val_hard_ds, hard_train_size
+
+    train_soft_list = [extract_pair_hh_soft(ex, alpha=alpha) for ex in raw_train]
+    full_soft = Dataset.from_list(train_soft_list)
+    split = full_soft.train_test_split(test_size=0.05, seed=42)
+    train_soft_ds = split["train"]
+    val_hard_ds = Dataset.from_list(
+        [
+            {"prompt": r["prompt"], "chosen": r["resp1"], "rejected": r["resp2"]}
+            for r in split["test"]
+        ]
+    )
+    hard_train_size = len(train_soft_ds)
+    return train_soft_ds, val_hard_ds, hard_train_size

@@ -5,9 +5,14 @@ from typing import Optional
 
 import torch
 
-from utils.config import BASE_MODEL_CHOICES
+from utils.config import BASE_MODEL_CHOICES, DPO_STEER_SOFT_DATASET_CHOICES as DATASET_CHOICES
 from utils.seed import set_seed
-from utils.datasets import build_helpsteer3_soft_datasets, build_ultrafeedback_soft_datasets, build_openbmb_soft_datasets
+from utils.datasets import (
+    build_helpsteer3_soft_datasets,
+    build_hh_rlhf_soft_steer_datasets,
+    build_openbmb_soft_datasets,
+    build_ultrafeedback_soft_datasets,
+)
 from utils.models import load_models_and_tokenizer
 from utils.training import train_dpo
 
@@ -15,8 +20,6 @@ from utils.training import train_dpo
 # ======================
 # main
 # ======================
-
-DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "openbmb")
 
 
 def main(
@@ -40,10 +43,10 @@ def main(
     alpha: параметр бета-приора для p_bayes (по умолчанию 1.0).
     use_bayes: если True, в loss используется p_bayes, иначе p (по умолчанию).
     base_model: "3b" (Qwen2.5-3B) или "7b" (Qwen2.5-7B).
-    dataset: "helpsteer3" | "ultrafeedback_binarized" | "openbmb" — для binarized/openbmb выдаётся soft-формат.
+    dataset: "helpsteer3" | "ultrafeedback_binarized" | "openbmb" | "hh_rlhf" (PKU processed HH-RLHF).
     batch_size: размер батча для train и validation.
     lambda_min: нижняя граница lambda_label по эпохам (смешивание меток с p_pred); 1.0 — как раньше, без смешивания.
-    use_chat_template: если None — False для текущих soft-датасетов; иначе явное значение для get_logps.
+    use_chat_template: если None — False, кроме hh_rlhf (True, как в hard_dpo_steer); иначе явное значение.
     """
     if dataset not in DATASET_CHOICES:
         raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
@@ -55,6 +58,9 @@ def main(
     elif dataset == "ultrafeedback_binarized":
         print("Загружаю UltraFeedback Binarized (soft)...")
         train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(alpha=alpha)
+    elif dataset == "hh_rlhf":
+        print("Загружаю PKU processed HH-RLHF (soft train, hard val)...")
+        train_soft_ds, val_hard_ds, hard_train_size = build_hh_rlhf_soft_steer_datasets(alpha=alpha)
     else:  # openbmb
         print("Загружаю openbmb/UltraFeedback (soft) + val ultrafeedback_binarized...")
         train_soft_ds, val_hard_ds, hard_train_size = build_openbmb_soft_datasets(alpha=alpha)
@@ -71,7 +77,7 @@ def main(
     )
 
     if use_chat_template is None:
-        use_chat_template = False
+        use_chat_template = dataset == "hh_rlhf"
 
     def log_fn(msg: str) -> None:
         print(msg, flush=True, file=sys.stderr)
@@ -113,7 +119,9 @@ def _lambda_min_type(x: str) -> float:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Soft-DPO на HelpSteer3 (train soft, validation hard)")
+    parser = argparse.ArgumentParser(
+        description="Soft-DPO (train soft, validation hard): HelpSteer3, UltraFeedback, openbmb или HH-RLHF (PKU)."
+    )
     parser.add_argument(
         "--resume", "-r",
         type=str,
@@ -125,7 +133,14 @@ if __name__ == "__main__":
     parser.add_argument("--use-bayes", action="store_true", help="Использовать p_bayes вместо p в качестве целевой вероятности (по умолчанию: p)")
     parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/soft_dpo_steer", help="Папка для чекпоинтов и train.log (для разных запусков задавайте разные папки)")
     parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b (Qwen2.5-3B-Instruct) или 7b (Qwen2.5-7B-Instruct). По умолчанию: 3b.")
-    parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Датасет: helpsteer3, ultrafeedback_binarized или openbmb (soft).")
+    parser.add_argument(
+        "--dataset",
+        "-d",
+        type=str,
+        default="helpsteer3",
+        choices=list(DATASET_CHOICES),
+        help="Датасет: helpsteer3, ultrafeedback_binarized, openbmb (soft) или hh_rlhf (PKU-Alignment/processed-hh-rlhf).",
+    )
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 5).")
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.3, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
@@ -140,7 +155,7 @@ if __name__ == "__main__":
     chat_group.add_argument(
         "--use-chat-template",
         action="store_true",
-        help="Считать log p через apply_chat_template (Qwen-Instruct).",
+        help="Считать log p через apply_chat_template (Qwen-Instruct). По умолчанию включено только для hh_rlhf.",
     )
     chat_group.add_argument(
         "--no-use-chat-template",

@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from utils.config import BASE_MODEL_CHOICES
+from utils.config import BASE_MODEL_CHOICES, DPO_STEER_HARD_DATASET_CHOICES as DATASET_CHOICES
 from utils.seed import set_seed
 from utils.datasets import (
     build_dpo_datasets,
@@ -18,8 +18,6 @@ from utils.training import train_dpo
 # ======================
 # main
 # ======================
-
-DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "hh_rlhf")
 
 
 def main(

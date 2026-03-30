@@ -11,6 +11,7 @@ from .openbmb import build_openbmb_soft_datasets
 from .hh_rlf_pku import (
     build_dpo_datasets_hh_rlhf,
     build_hh_rlhf_soft_datasets,
+    build_hh_rlhf_soft_steer_datasets,
     extract_pair_hh_soft,
 )
 
@@ -21,6 +22,7 @@ __all__ = [
     "build_ultrafeedback_soft_datasets",
     "build_openbmb_soft_datasets",
     "build_hh_rlhf_soft_datasets",
+    "build_hh_rlhf_soft_steer_datasets",
     "build_dpo_datasets_hh_rlhf",
     "extract_pair_hh_soft",
 ]
