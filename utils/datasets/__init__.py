@@ -14,6 +14,7 @@ from .hh_rlf_pku import (
     build_hh_rlhf_soft_steer_datasets,
     extract_pair_hh_soft,
 )
+from .common import precompute_p_pred_cached
 
 __all__ = [
     "build_dpo_datasets",
@@ -25,4 +26,5 @@ __all__ = [
     "build_hh_rlhf_soft_steer_datasets",
     "build_dpo_datasets_hh_rlhf",
     "extract_pair_hh_soft",
+    "precompute_p_pred_cached",
 ]

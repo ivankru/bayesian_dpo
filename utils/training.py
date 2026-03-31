@@ -2,6 +2,7 @@
 """
 Общий цикл обучения одной эпохи для DPO и универсальная функция train_dpo (режимы hard / soft / bayes).
 """
+import math
 import os
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -14,11 +15,11 @@ from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 
 from utils.config import MAX_FULL_LEN, MAX_PROMPT_LEN
-from utils.loss import _logps, hard_dpo_loss, soft_dpo_loss
+from utils.datasets import precompute_p_pred_cached
+from utils.loss import hard_dpo_loss, soft_dpo_loss
 from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
-
 
 @contextmanager
 def _mlflow_training_context(
@@ -68,64 +69,6 @@ def collate_fn_soft(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
     if examples and "p_pred_cached" in examples[0]:
         out["p_pred_cached"] = [e["p_pred_cached"] for e in examples]
     return out
-
-
-def precompute_p_pred_cached(
-    train_ds: Dataset,
-    tokenizer,
-    policy_model,
-    ref_model,
-    device: str,
-    beta: float,
-    use_chat_template: bool,
-    batch_size: int,
-    collate_fn: Callable[..., Any],
-) -> Dataset:
-    """
-    Один проход по train_ds (порядок строк датасета): считаете
-    p_pred = sigmoid(beta * ((logp1-logp2) - (logp1_ref-logp2_ref))) как в soft_dpo_loss,
-    записывает столбец p_pred_cached. Политика и ref — в torch.no_grad().
-    """
-    loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0,
-    )
-    p_preds: List[float] = []
-    policy_model.eval()
-    with torch.no_grad():
-        for batch in loader:
-            prompts = batch["prompt"]
-            resp1 = batch["resp1"]
-            resp2 = batch["resp2"]
-            logp_1 = _logps(
-                policy_model, tokenizer, prompts, resp1, device, use_chat_template
-            )
-            logp_2 = _logps(
-                policy_model, tokenizer, prompts, resp2, device, use_chat_template
-            )
-            logp_1_ref = _logps(
-                ref_model, tokenizer, prompts, resp1, device, use_chat_template
-            )
-            logp_2_ref = _logps(
-                ref_model, tokenizer, prompts, resp2, device, use_chat_template
-            )
-            delta_theta = logp_1 - logp_2
-            delta_ref = logp_1_ref - logp_2_ref
-            diff = delta_theta - delta_ref
-            logit = beta * diff
-            p_pred_batch = torch.sigmoid(logit)
-            p_preds.extend(p_pred_batch.detach().cpu().float().tolist())
-
-    assert len(p_preds) == len(train_ds), (
-        f"p_pred_cached length {len(p_preds)} != len(train_ds) {len(train_ds)}"
-    )
-
-    if "p_pred_cached" in train_ds.column_names:
-        train_ds = train_ds.remove_columns(["p_pred_cached"])
-    return train_ds.add_column("p_pred_cached", p_preds)
 
 
 def train_one_epoch_dpo(
@@ -203,6 +146,7 @@ def train_dpo(
     dataset_name: Optional[str] = None,
     model_name: Optional[str] = None,
     lambda_min: float = 1.0,
+    lambda_schedule: str = "linear",
     seed: int = 42,
     use_chat_template: bool = False,
     log=print,
@@ -229,6 +173,10 @@ def train_dpo(
         raise ValueError(f"mode должен быть один из {DPO_MODE_CHOICES}, получено: {mode!r}")
     if not 0.0 <= lambda_min <= 1.0:
         raise ValueError(f"lambda_min must be in [0, 1], got {lambda_min!r}")
+    if lambda_schedule not in ("linear", "cosine"):
+        raise ValueError(
+            f"lambda_schedule must be one of ('linear', 'cosine'), got {lambda_schedule!r}"
+        )
 
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, "train.log")
@@ -245,6 +193,7 @@ def train_dpo(
         "batch_size": batch_size,
         "epochs": epochs,
         "lambda_min": lambda_min,
+        "lambda_schedule": lambda_schedule,
         "seed": seed,
         "dataset_name": dataset_name,
         "model_name": model_name,
@@ -368,14 +317,22 @@ def train_dpo(
                 # progress_epoch = epoch / (epochs - 1) if epochs > 1 else 1.0
                 # lambda_label_epoch = max(lambda_min, 1.0 - progress_epoch)
                 if epochs > 1:
-                    progress_epoch = epoch / (epochs - 1)   # 0 ... 1
+                    progress_epoch = epoch / (epochs - 1)  # 0 ... 1
                 else:
                     progress_epoch = 1.0
 
-                lambda_label_epoch = 1.0 - (1.0 - lambda_min) * progress_epoch
+                if lambda_schedule == "linear":
+                    lambda_label_epoch = 1.0 - (1.0 - lambda_min) * progress_epoch
+                else:  # cosine
+                    lambda_label_epoch = (
+                        lambda_min
+                        + (1.0 - lambda_min)
+                        * (1.0 + math.cos(math.pi * progress_epoch))
+                        / 2.0
+                    )
 
                 epoch_loss_kwargs = {**loss_kwargs, "lambda_label": lambda_label_epoch}
-                log_msg(f"Epoch {epoch + 1}/{epochs}: lambda_label={lambda_label_epoch:.6f}")
+                log_msg(f"Epoch {epoch + 1}/{epochs}, lambda_label={lambda_label_epoch:.6f}")
 
                 if lambda_label_epoch < 1.0:
                     train_ds = precompute_p_pred_cached(

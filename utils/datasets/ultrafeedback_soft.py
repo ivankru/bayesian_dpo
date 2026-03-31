@@ -1,10 +1,44 @@
 # -*- coding: utf-8 -*-
 """UltraFeedback Binarized: soft DPO (Bradley-Terry)."""
+import random
 from typing import Dict, Any, Optional
 
-from datasets import load_dataset, Dataset
+from datasets import Dataset, load_dataset
 
 from .common import sigmoid, ultrafeedback_message_to_response
+
+
+def flip_binary_labels(
+    ds: Dataset,
+    noise_prob: float,
+    seed: int,
+    alpha: float,
+    col_name: str = "p",
+) -> Dataset:
+    """
+    С заданной вероятностью noise_prob переворачивает бинарные метки в колонке col_name: 0 -> 1, 1 -> 0.
+    Шум фиксирован по seed для воспроизводимости.
+    """
+    if noise_prob <= 0.0:
+        return ds
+
+    rng = random.Random(seed)
+
+    def _flip(example, idx):
+        p = example[col_name]
+        # Ожидаем p в {0.0, 1.0}; на всякий случай поддержим и "почти" бинарные значения
+        if rng.random() < noise_prob:
+            if p == 0.0:
+                example[col_name] = 1.0
+            elif p == 1.0:
+                example[col_name] = 0.0
+            else:
+                example[col_name] = 1.0 - p
+        p_cur = float(example[col_name])
+        example["p_bayes"] = (alpha + p_cur) / (2.0 * alpha + 1.0)
+        return example
+
+    return ds.map(_flip, with_indices=True)
 
 
 def extract_pair_soft_ultrafeedback(
@@ -33,7 +67,11 @@ def extract_pair_soft_ultrafeedback(
     }
 
 
-def build_ultrafeedback_soft_datasets(alpha: float = 1.0):
+def build_ultrafeedback_soft_datasets(
+    alpha: float,
+    label_noise_prob: float = 0.0,
+    seed: int = 42,
+):
     """
     UltraFeedback Binarized для soft-DPO: resp1=chosen, resp2=rejected, p из Bradley-Terry.
     Возвращает: train_soft_ds, val_hard_ds, hard_train_size.
@@ -48,6 +86,13 @@ def build_ultrafeedback_soft_datasets(alpha: float = 1.0):
         if out is not None:
             train_soft_processed.append(out)
     train_soft_ds = Dataset.from_list(train_soft_processed)
+    train_soft_ds = flip_binary_labels(
+        train_soft_ds,
+        noise_prob=label_noise_prob,
+        seed=seed,
+        alpha=alpha,
+        col_name="p",
+    )
 
     val_processed = []
     for ex in val_raw:

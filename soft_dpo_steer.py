@@ -26,6 +26,7 @@ def main(
     resume_from: Optional[str] = None,
     seed: int = 42,
     alpha: float = 1.0,
+    label_noise_prob: float = 0.0,
     use_bayes: bool = False,
     output_dir: str = "checkpoints/soft_dpo_steer",
     base_model: str = "3b",
@@ -35,6 +36,7 @@ def main(
     beta: float = 0.2,
     epochs: int = 8,
     lambda_min: float = 1.0,
+    lambda_schedule: str = "linear",
     use_chat_template: Optional[bool] = None,
 ):
     """
@@ -54,10 +56,18 @@ def main(
     model_name = BASE_MODEL_CHOICES[base_model]
     if dataset == "helpsteer3":
         print("Загружаю HelpSteer3-Preference...")
-        train_soft_ds, val_hard_ds, hard_train_size = build_helpsteer3_soft_datasets(alpha=alpha)
+        train_soft_ds, val_hard_ds, hard_train_size = build_helpsteer3_soft_datasets(
+            alpha=alpha,
+            label_noise_prob=label_noise_prob,
+            seed=seed,
+        )
     elif dataset == "ultrafeedback_binarized":
         print("Загружаю UltraFeedback Binarized (soft)...")
-        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(alpha=alpha)
+        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(
+            alpha=alpha,
+            label_noise_prob=label_noise_prob,
+            seed=seed,
+        )
     elif dataset == "hh_rlhf":
         print("Загружаю PKU processed HH-RLHF (soft train, hard val)...")
         train_soft_ds, val_hard_ds, hard_train_size = build_hh_rlhf_soft_steer_datasets(alpha=alpha)
@@ -103,6 +113,7 @@ def main(
         dataset_name=dataset,
         model_name=model_name,
         lambda_min=lambda_min,
+        lambda_schedule=lambda_schedule,
         seed=seed,
         use_chat_template=use_chat_template,
         log=log_fn,
@@ -129,6 +140,12 @@ if __name__ == "__main__":
         help="Путь к чекпоинту для продолжения обучения (например checkpoints/soft_dpo_steer/best)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed для воспроизводимости (должен совпадать с hard_dpo_steer для сравнения)")
+    parser.add_argument(
+        "--label-noise-prob",
+        type=float,
+        default=0.0,
+        help="Probability to flip binary labels p (0↔1) in TRAIN part of soft datasets (HelpSteer3, ultrafeedback_binarized).",
+    )
     parser.add_argument("--alpha", type=float, default=0.2, help="Параметр бета-приора для p_bayes; имеет смысл только при --use-bayes (по умолчанию 1.0)")
     parser.add_argument("--use-bayes", action="store_true", help="Использовать p_bayes вместо p в качестве целевой вероятности (по умолчанию: p)")
     parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/soft_dpo_steer", help="Папка для чекпоинтов и train.log (для разных запусков задавайте разные папки)")
@@ -151,6 +168,13 @@ if __name__ == "__main__":
         default=1.0,
         help="Минимум lambda_label по эпохам [0, 1]; 1.0 = только метки из датасета (по умолчанию: 1.0).",
     )
+    parser.add_argument(
+        "--lambda-schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine"],
+        help="Schedule for lambda_label over epochs (linear or cosine).",
+    )
     chat_group = parser.add_mutually_exclusive_group()
     chat_group.add_argument(
         "--use-chat-template",
@@ -172,6 +196,7 @@ if __name__ == "__main__":
         resume_from=args.resume,
         seed=args.seed,
         alpha=args.alpha,
+        label_noise_prob=args.label_noise_prob,
         use_bayes=args.use_bayes,
         output_dir=args.output_dir,
         base_model=args.base_model,
@@ -181,5 +206,6 @@ if __name__ == "__main__":
         beta=args.beta,
         epochs=args.epochs,
         lambda_min=args.lambda_min,
+        lambda_schedule=args.lambda_schedule,
         use_chat_template=use_chat_template,
     )
