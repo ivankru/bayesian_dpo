@@ -115,6 +115,7 @@ def main(
         lambda_min=lambda_min,
         lambda_schedule=lambda_schedule,
         seed=seed,
+        label_noise_prob=label_noise_prob,
         use_chat_template=use_chat_template,
         log=log_fn,
     )

@@ -148,6 +148,7 @@ def train_dpo(
     lambda_min: float = 1.0,
     lambda_schedule: str = "linear",
     seed: int = 42,
+    label_noise_prob: Optional[float] = None,
     use_chat_template: bool = False,
     log=print,
     use_mlflow: bool = False,
@@ -166,6 +167,7 @@ def train_dpo(
     num_training_steps_override: для soft/bayes можно задать число шагов (например по hard train size) для выравнивания LR schedule.
     lambda_min: для soft/bayes — нижняя граница lambda_label по эпохам (смешивание с p_pred); при 1.0 поведение как раньше.
     seed: фиксирует shuffle train DataLoader (torch.Generator + num_workers=0).
+    label_noise_prob: вероятность шума меток при сборке soft train (--label-noise-prob); для hard не задаётся (в логе N/A).
     use_chat_template: если True, get_logps использует tokenizer.apply_chat_template (Qwen-Instruct); иначе plain prompt\\nresponse.
     use_mlflow: логировать параметры, метрики и train.log в MLflow (tracking URI из mlflow_tracking_uri или окружения по умолчанию).
     """
@@ -199,6 +201,7 @@ def train_dpo(
         "model_name": model_name,
         "output_dir": output_dir,
         "alpha": alpha,
+        "label_noise_prob": label_noise_prob,
         "use_chat_template": use_chat_template,
         "num_training_steps_override": num_training_steps_override,
     }
@@ -250,8 +253,9 @@ def train_dpo(
 
         log_msg(f"=== {mode_label} ===")
         log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
+        _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
         log_msg(
-            f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, seed={seed}"
+            f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, label_noise_prob={_lnp}, seed={seed}"
         )
         log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
 
