@@ -16,6 +16,7 @@ DPO_STEER_HARD_DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "hh_r
 DPO_STEER_SOFT_DATASET_CHOICES = (
     "helpsteer3",
     "ultrafeedback_binarized",
+    "ultrafeedback_soft",
     "openbmb",
     "hh_rlhf",
 )

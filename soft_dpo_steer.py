@@ -11,7 +11,8 @@ from utils.datasets import (
     build_helpsteer3_soft_datasets,
     build_hh_rlhf_soft_steer_datasets,
     build_openbmb_soft_datasets,
-    build_ultrafeedback_soft_datasets,
+    build_ultrafeedback_binarized_soft_datasets,
+    build_ultrafeedback_score_soft_datasets,
 )
 from utils.models import load_models_and_tokenizer
 from utils.training import train_dpo
@@ -45,7 +46,7 @@ def main(
     alpha: параметр бета-приора для p_bayes (по умолчанию 1.0).
     use_bayes: если True, в loss используется p_bayes, иначе p (по умолчанию).
     base_model: "3b" (Qwen2.5-3B) или "7b" (Qwen2.5-7B).
-    dataset: "helpsteer3" | "ultrafeedback_binarized" | "openbmb" | "hh_rlhf" (PKU processed HH-RLHF).
+    dataset: helpsteer3 | ultrafeedback_binarized (бинарные p) | ultrafeedback_soft (p из скоров) | openbmb | hh_rlhf.
     batch_size: размер батча для train и validation.
     lambda_min: нижняя граница lambda_label по эпохам (смешивание меток с p_pred); 1.0 — как раньше, без смешивания.
     use_chat_template: если None — False, кроме hh_rlhf (True, как в hard_dpo_steer); иначе явное значение.
@@ -62,8 +63,15 @@ def main(
             seed=seed,
         )
     elif dataset == "ultrafeedback_binarized":
-        print("Загружаю UltraFeedback Binarized (soft)...")
-        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_soft_datasets(
+        print("Загружаю UltraFeedback Binarized (бинарные метки chosen>rejected)...")
+        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_binarized_soft_datasets(
+            alpha=alpha,
+            label_noise_prob=label_noise_prob,
+            seed=seed,
+        )
+    elif dataset == "ultrafeedback_soft":
+        print("Загружаю UltraFeedback (мягкие метки по score_chosen/score_rejected)...")
+        train_soft_ds, val_hard_ds, hard_train_size = build_ultrafeedback_score_soft_datasets(
             alpha=alpha,
             label_noise_prob=label_noise_prob,
             seed=seed,
@@ -132,7 +140,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Soft-DPO (train soft, validation hard): HelpSteer3, UltraFeedback, openbmb или HH-RLHF (PKU)."
+        description=(
+            "Soft-DPO (train soft, validation hard): HelpSteer3; UltraFeedback бинарный или score-soft; "
+            "openbmb; HH-RLHF (PKU)."
+        )
     )
     parser.add_argument(
         "--resume", "-r",
@@ -145,7 +156,11 @@ if __name__ == "__main__":
         "--label-noise-prob",
         type=float,
         default=0.0,
-        help="Probability to flip binary labels p (0↔1) in TRAIN part of soft datasets (HelpSteer3, ultrafeedback_binarized).",
+        help=(
+            "Train label noise: для бинарных датасетов (HelpSteer3, ultrafeedback_binarized) — "
+            "переворот p 0↔1 с заданной вероятностью; для ultrafeedback_soft — замена p на 1−p "
+            "(и пересчёт p_bayes) с той же вероятностью."
+        ),
     )
     parser.add_argument("--alpha", type=float, default=0.2, help="Параметр бета-приора для p_bayes; имеет смысл только при --use-bayes (по умолчанию 1.0)")
     parser.add_argument("--use-bayes", action="store_true", help="Использовать p_bayes вместо p в качестве целевой вероятности (по умолчанию: p)")
@@ -157,7 +172,10 @@ if __name__ == "__main__":
         type=str,
         default="helpsteer3",
         choices=list(DATASET_CHOICES),
-        help="Датасет: helpsteer3, ultrafeedback_binarized, openbmb (soft) или hh_rlhf (PKU-Alignment/processed-hh-rlhf).",
+        help=(
+            "Датасет: helpsteer3; ultrafeedback_binarized (жёсткое chosen>rejected, p∈{0,1}); "
+            "ultrafeedback_soft (p=sigmoid(Δscore)); openbmb (soft); hh_rlhf (PKU processed)."
+        ),
     )
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 5).")
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate (по умолчанию: 2e-5).")

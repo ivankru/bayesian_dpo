@@ -255,7 +255,7 @@ def train_dpo(
         log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
         _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
         log_msg(
-            f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, label_noise_prob={_lnp}, seed={seed}"
+            f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, label_noise_prob={_lnp}, seed={seed}"
         )
         log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
 
