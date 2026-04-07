@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -158,6 +159,39 @@ def load_alpaca_eval_v2_data(
     return out
 
 
+def _find_checkpoint_in_dataset_subdir(missing: Path) -> Optional[Path]:
+    """
+    Обучающие скрипты кладут чекпоинты в checkpoints/<dataset>/<run>/best.
+    Если передан несуществующий checkpoints/<run>/best, ищем единственный
+    checkpoints/*/<run>/best под тем же checkpoints/.
+    """
+    if missing.name != "best":
+        return None
+    run_dir = missing.parent
+    run_name = run_dir.name
+    checkpoints_root: Optional[Path] = None
+    for p in missing.parents:
+        if p.name == "checkpoints":
+            checkpoints_root = p
+            break
+    if checkpoints_root is None or not checkpoints_root.is_dir():
+        return None
+    # Уже был бы валидный путь: checkpoints/<ds>/<run>/best
+    if run_dir.parent != checkpoints_root:
+        return None
+    found: List[Path] = []
+    try:
+        for ds_dir in checkpoints_root.iterdir():
+            cand = ds_dir / run_name / "best"
+            if cand.is_dir():
+                found.append(cand.resolve())
+    except OSError:
+        return None
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
 def load_candidate_model(
     checkpoint_dir: str,
     base_model: str = BASE_MODEL,
@@ -168,18 +202,94 @@ def load_candidate_model(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    checkpoint_arg_raw = checkpoint_dir
+    ckpt_path = Path(checkpoint_arg_raw).expanduser().resolve()
+    recovered: Optional[Path] = None
+    if not ckpt_path.is_dir():
+        recovered = _find_checkpoint_in_dataset_subdir(ckpt_path)
+        if recovered is not None:
+            print(
+                f"Чекпоинт: каталог по указанному пути не найден, используется {recovered}",
+                flush=True,
+            )
+            ckpt_path = recovered
+    checkpoint_dir = str(ckpt_path)
+    # #region agent log
+    try:
+        with open(
+            "/home/jovyan/kruzhilov/.cursor/debug-acece9.log",
+            "a",
+            encoding="utf-8",
+        ) as _df:
+            _df.write(
+                json.dumps(
+                    {
+                        "sessionId": "acece9",
+                        "runId": os.environ.get("DEBUG_AGENT_RUN_ID", "pre-fix"),
+                        "hypothesisId": "A-B",
+                        "location": "alpaca_eval_judge.py:load_candidate_model",
+                        "message": "checkpoint path resolution",
+                        "data": {
+                            "cwd": os.getcwd(),
+                            "raw_arg": checkpoint_arg_raw,
+                            "resolved": checkpoint_dir,
+                            "dataset_subdir_recovered": str(recovered)
+                            if recovered is not None
+                            else None,
+                            "is_dir": ckpt_path.is_dir(),
+                            "has_adapter_config": (ckpt_path / "adapter_config.json").is_file(),
+                            "has_config_json": (ckpt_path / "config.json").is_file(),
+                        },
+                        "timestamp": int(time.time() * 1000),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
+    # #endregion
 
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        torch_dtype=dtype,
-        device_map=device,
+    if not ckpt_path.is_dir():
+        raise FileNotFoundError(
+            f"Каталог чекпоинта не найден: {checkpoint_arg_raw!r} → {checkpoint_dir!r} "
+            f"(текущая рабочая директория: {os.getcwd()!r}). "
+            "Частая причина: чекпоинт лежит в checkpoints/<датасет>/<run>/best "
+            "(например checkpoints/hhrlf/hard_hhrlf_lr1_5e5_beta01/best), а не в checkpoints/<run>/best. "
+            "Укажите полный путь или запустите скрипт из каталога, относительно которого корректен относительный путь."
+        )
+
+    adapter_cfg = ckpt_path / "adapter_config.json"
+    if adapter_cfg.is_file():
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=dtype,
+            device_map=device,
+        )
+        model = PeftModel.from_pretrained(model, checkpoint_dir)
+        model.eval()
+        return tokenizer, model, device
+
+    if (ckpt_path / "config.json").is_file():
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_dir,
+            torch_dtype=dtype,
+            device_map=device,
+        )
+        model.eval()
+        return tokenizer, model, device
+
+    raise FileNotFoundError(
+        f"В {checkpoint_dir!r} нет adapter_config.json (адаптер LoRA) "
+        "и нет config.json (полная модель). Проверьте путь к чекпоинту."
     )
-    model = PeftModel.from_pretrained(model, checkpoint_dir)
-    model.eval()
-    return tokenizer, model, device
 
 
 def load_base_model(
