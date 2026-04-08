@@ -14,6 +14,10 @@
 !utils/datasets/*.py
 !utils/seed.py
 
+# Исключение: скрипты (plot_val_distributions и др.)
+!scripts/
+!scripts/*.py
+
 # Исключение: сам .gitignore должен быть в репозитории
 !.gitignore
 

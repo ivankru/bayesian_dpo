@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import mlflow
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from datasets import Dataset
@@ -18,6 +19,8 @@ from utils.config import MAX_FULL_LEN, MAX_PROMPT_LEN
 from utils.datasets import precompute_p_pred_cached
 from utils.loss import hard_dpo_loss, soft_dpo_loss
 from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
+from utils.val_distributions import compute_val_delta_distributions
+from utils.val_kl_mc import estimate_val_kl_mc
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
 
@@ -155,6 +158,11 @@ def train_dpo(
     mlflow_experiment: str = "bayesian_dpo",
     mlflow_run_name: Optional[str] = None,
     mlflow_tracking_uri: Optional[str] = None,
+    val_kl_mc_max_prompts: Optional[int] = None,
+    val_kl_mc_num_samples: int = 4,
+    val_kl_mc_max_new_tokens: int = 128,
+    val_kl_mc_prompt_batch_size: int = 6,
+    val_distributions_max_batches: Optional[int] = None,
 ):
     """
     Универсальный цикл DPO: hard, soft или bayes.
@@ -170,6 +178,11 @@ def train_dpo(
     label_noise_prob: вероятность шума меток при сборке soft train (--label-noise-prob); для hard не задаётся (в логе N/A).
     use_chat_template: если True, get_logps использует tokenizer.apply_chat_template (Qwen-Instruct); иначе plain prompt\\nresponse.
     use_mlflow: логировать параметры, метрики и train.log в MLflow (tracking URI из mlflow_tracking_uri или окружения по умолчанию).
+    val_kl_mc_max_prompts: если задано (>0), в конце каждой эпохи считается MC-оценка KL(π‖ref) по сэмплам π_θ
+          на первых N промптах val (см. utils.val_kl_mc.estimate_val_kl_mc); лог: val_kl_mc, метрика MLflow при use_mlflow.
+    val_kl_mc_num_samples: число независимых генераций на промпт для MC.
+    val_distributions_max_batches: если задано (>0), после основных val-метрик считаются распределения
+        delta_theta, delta_ref, diff на первых N батчах val; лог, MLflow, np.savez_compressed в output_dir.
     """
     if mode not in DPO_MODE_CHOICES:
         raise ValueError(f"mode должен быть один из {DPO_MODE_CHOICES}, получено: {mode!r}")
@@ -204,6 +217,10 @@ def train_dpo(
         "label_noise_prob": label_noise_prob,
         "use_chat_template": use_chat_template,
         "num_training_steps_override": num_training_steps_override,
+        "val_kl_mc_max_prompts": val_kl_mc_max_prompts,
+        "val_kl_mc_num_samples": val_kl_mc_num_samples,
+        "val_kl_mc_max_new_tokens": val_kl_mc_max_new_tokens,
+        "val_distributions_max_batches": val_distributions_max_batches,
     }
 
     with _mlflow_training_context(
@@ -418,6 +435,89 @@ def train_dpo(
             log_msg(f"validation KL(π||ref) : {val_kl:.4f}")
             log_msg(f"validation pair NLL   : {val_nll:.4f}")
             log_msg(f"validation pair acc   : {val_acc:.4f}")
+
+            if (
+                val_distributions_max_batches is not None
+                and val_distributions_max_batches > 0
+                and len(val_ds) > 0
+            ):
+                dist = compute_val_delta_distributions(
+                    policy_model,
+                    ref_model,
+                    tokenizer,
+                    val_loader,
+                    device,
+                    use_chat_template=use_chat_template,
+                    max_batches=val_distributions_max_batches,
+                )
+                dt = dist["delta_theta"]
+                dr = dist["delta_ref"]
+                margin = dist["diff"]
+
+                def _val_dist_stats_line(label: str, arr: np.ndarray) -> str:
+                    if arr.size == 0:
+                        return f"{label}: (no samples)"
+                    mean = float(np.mean(arr))
+                    std = float(np.std(arr))
+                    med = float(np.median(arr))
+                    p5 = float(np.percentile(arr, 5))
+                    p95 = float(np.percentile(arr, 95))
+                    return (
+                        f"{label}: mean={mean:.2f} std={std:.2f} median={med:.2f} "
+                        f"p5={p5:.2f} p95={p95:.2f}"
+                    )
+
+                log_msg(_val_dist_stats_line("val_delta_theta  ", dt))
+                log_msg(_val_dist_stats_line("val_delta_ref    ", dr))
+                log_msg(_val_dist_stats_line("val_diff (margin)", margin))
+
+                if use_mlflow and margin.size > 0:
+                    mlflow.log_metric(
+                        "val_delta_theta_mean", float(np.mean(dt)), step=global_step
+                    )
+                    mlflow.log_metric(
+                        "val_delta_ref_mean", float(np.mean(dr)), step=global_step
+                    )
+                    mlflow.log_metric(
+                        "val_diff_mean", float(np.mean(margin)), step=global_step
+                    )
+                    mlflow.log_metric(
+                        "val_diff_std", float(np.std(margin)), step=global_step
+                    )
+
+                npz_path = os.path.join(
+                    output_dir, f"val_distributions_epoch{epoch + 1}.npz"
+                )
+                np.savez_compressed(
+                    npz_path,
+                    delta_theta=dt,
+                    delta_ref=dr,
+                    diff=margin,
+                )
+
+            if (
+                val_kl_mc_max_prompts is not None
+                and val_kl_mc_max_prompts > 0
+                and len(val_ds) > 0
+            ):
+                n_mc = min(int(val_kl_mc_max_prompts), len(val_ds))
+                mc_prompts = val_ds.select(range(n_mc))["prompt"]
+                val_kl_mc = estimate_val_kl_mc(
+                    policy_model,
+                    ref_model,
+                    tokenizer,
+                    mc_prompts,
+                    device,
+                    num_samples_per_prompt=val_kl_mc_num_samples,
+                    max_new_tokens=val_kl_mc_max_new_tokens,
+                    use_chat_template=use_chat_template,
+                    prompt_batch_size=val_kl_mc_prompt_batch_size,
+                )
+                log_msg(
+                    f"validation KL_MC (π‖ref, MC samples from policy, {n_mc} prompts × {val_kl_mc_num_samples}) : {val_kl_mc:.4f}"
+                )
+                if use_mlflow:
+                    mlflow.log_metric("val_kl_mc", val_kl_mc, step=global_step)
 
             if val_nll < best_val_nll:
                 best_val_nll = val_nll
