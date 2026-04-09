@@ -8,8 +8,9 @@ MAX_FULL_LEN = 1536   #1024# prompt+response
 
 # Базовые модели
 BASE_MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
+BASE_MODEL_4B = "Qwen/Qwen3-4B-Instruct-2507"
 BASE_MODEL_7B = "Qwen/Qwen2.5-7B-Instruct"
-BASE_MODEL_CHOICES = {"3b": BASE_MODEL_3B, "7b": BASE_MODEL_7B}
+BASE_MODEL_CHOICES = {"3b": BASE_MODEL_3B, "4b": BASE_MODEL_4B, "7b": BASE_MODEL_7B}
 
 # Имена --dataset для hard_dpo_steer / soft_dpo_steer (совпадают с dataset_name в логах train_dpo)
 DPO_STEER_HARD_DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "hh_rlhf")

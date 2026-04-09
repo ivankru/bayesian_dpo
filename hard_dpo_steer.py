@@ -39,7 +39,7 @@ def main(
     seed: для воспроизводимости; одинаковый seed в hard_dpo_steer и soft_steer даёт совпадающие начальные метрики на val.
     output_dir: папка для чекпоинтов и train.log.
     dataset: "helpsteer3" | "ultrafeedback_binarized" | "hh_rlhf" (PKU processed HH-RLHF).
-    base_model: "3b" (Qwen2.5-3B) или "7b" (Qwen2.5-7B).
+    base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507.
     batch_size: размер батча для train и validation.
     lambda_min: для режима hard не используется (оставлено для единообразия CLI с soft_dpo_steer).
     use_chat_template: если None — для hh_rlhf True (PKU HH), иначе False; иначе явное значение для get_logps.
@@ -124,7 +124,13 @@ if __name__ == "__main__":
         choices=list(DATASET_CHOICES),
         help="Датасет: helpsteer3, ultrafeedback_binarized или hh_rlhf (PKU-Alignment/processed-hh-rlhf).",
     )
-    parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b (Qwen2.5-3B-Instruct) или 7b (Qwen2.5-7B-Instruct). По умолчанию: 3b.")
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        choices=list(BASE_MODEL_CHOICES.keys()),
+        default="3b",
+        help="Базовая модель: 3b/7b — Qwen2.5-Instruct; 4b — Qwen3-4B-Instruct-2507. По умолчанию: 3b.",
+    )
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")

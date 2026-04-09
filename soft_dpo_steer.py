@@ -45,7 +45,7 @@ def main(
     seed: для воспроизводимости; тот же seed, что в hard_dpo_steer (по умолчанию 42), даёт совпадающие начальные метрики на val.
     alpha: параметр бета-приора для p_bayes (по умолчанию 1.0).
     use_bayes: если True, в loss используется p_bayes, иначе p (по умолчанию).
-    base_model: "3b" (Qwen2.5-3B) или "7b" (Qwen2.5-7B).
+    base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507.
     dataset: helpsteer3 | ultrafeedback_binarized (бинарные p) | ultrafeedback_soft (p из скоров) | openbmb | hh_rlhf.
     batch_size: размер батча для train и validation.
     lambda_min: нижняя граница lambda_label по эпохам (смешивание меток с p_pred); 1.0 — как раньше, без смешивания.
@@ -165,7 +165,13 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=0.2, help="Параметр бета-приора для p_bayes; имеет смысл только при --use-bayes (по умолчанию 1.0)")
     parser.add_argument("--use-bayes", action="store_true", help="Использовать p_bayes вместо p в качестве целевой вероятности (по умолчанию: p)")
     parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/soft_dpo_steer", help="Папка для чекпоинтов и train.log (для разных запусков задавайте разные папки)")
-    parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b (Qwen2.5-3B-Instruct) или 7b (Qwen2.5-7B-Instruct). По умолчанию: 3b.")
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        choices=list(BASE_MODEL_CHOICES.keys()),
+        default="3b",
+        help="Базовая модель: 3b/7b — Qwen2.5-Instruct; 4b — Qwen3-4B-Instruct-2507. По умолчанию: 3b.",
+    )
     parser.add_argument(
         "--dataset",
         "-d",
