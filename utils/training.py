@@ -24,6 +24,30 @@ from utils.val_kl_mc import estimate_val_kl_mc
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
 
+# Soft/Bayes-ADPO: половинная эпоха — валидация и обновление lambda / p_pred_cached.
+ULTRAFB_MID_EPOCH_DATASETS = frozenset(
+    {"openbmb", "ultrafeedback_binarized", "ultrafeedback_soft"}
+)
+
+
+def _lambda_label_at_progress(
+    progress: float, lambda_min: float, lambda_schedule: str
+) -> float:
+    """progress in [0, 1]: как в основном цикле эпох (linear / cosine)."""
+    progress = max(0.0, min(1.0, float(progress)))
+    if lambda_schedule == "linear":
+        return 1.0 - (1.0 - lambda_min) * progress
+    return lambda_min + (1.0 - lambda_min) * (1.0 + math.cos(math.pi * progress)) / 2.0
+
+
+def _mid_epoch_progress(epoch_one_based: int, epochs: int) -> float:
+    """Доля расписания для метки эпохи k.5 (epoch_one_based = k), k >= 1."""
+    if epochs <= 1:
+        return 0.5
+    e0 = epoch_one_based - 1  # 0-based индекс эпохи
+    return min(1.0, (e0 + 0.5) / (epochs - 1))
+
+
 @contextmanager
 def _mlflow_training_context(
     enabled: bool,
@@ -85,23 +109,28 @@ def train_one_epoch_dpo(
     scheduler,
     epoch: int,
     global_step: int,
+    loss_kw: Dict[str, Any],
     log=print,
     use_mlflow: bool = False,
-    **loss_kwargs: Any,
+    mid_epoch_hook: Optional[Callable[[int], None]] = None,
 ) -> int:
     """
-    Одна эпоха DPO. loss_fn(batch, tokenizer, policy_model, ref_model, device, **loss_kwargs)
-    должна возвращать (loss, kl_approx).
+    Одна эпоха DPO. loss_fn(..., **loss_kw) возвращает (loss, kl_approx).
+    loss_kw изменяется in-place (например lambda_label после mid_epoch_hook).
+    mid_epoch_hook(global_step): после len(loader)//2 батчей (если батчей >= 2) один раз.
     """
     policy_model.train()
     running_loss = 0.0
     running_kl = 0.0
     log_interval = 100
+    n_total = len(train_loader)
+    n_first = n_total // 2
+    batches_done = 0
 
     for batch in train_loader:
         optimizer.zero_grad(set_to_none=True)
         loss, kl_batch = loss_fn(
-            batch, tokenizer, policy_model, ref_model, device, **loss_kwargs
+            batch, tokenizer, policy_model, ref_model, device, **loss_kw
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
@@ -111,6 +140,16 @@ def train_one_epoch_dpo(
         running_loss += loss.item()
         running_kl += kl_batch
         global_step += 1
+        batches_done += 1
+
+        if (
+            mid_epoch_hook is not None
+            and n_total >= 2
+            and batches_done == n_first
+            and batches_done < n_total
+        ):
+            mid_epoch_hook(global_step)
+            mid_epoch_hook = None
 
         if global_step % 1000 == 0:
             lr_cur = optimizer.param_groups[0]["lr"]
@@ -183,6 +222,9 @@ def train_dpo(
     val_kl_mc_num_samples: число независимых генераций на промпт для MC.
     val_distributions_max_batches: если задано (>0), после основных val-метрик считаются распределения
         delta_theta, delta_ref, diff на первых N батчах val; лог, MLflow, np.savez_compressed в output_dir.
+    Для soft/bayes и датасетов openbmb, ultrafeedback_binarized, ultrafeedback_soft при epochs>=2:
+        после первой половины батчей эпохи — валидация с меткой «1.5», «2.5», …; затем lambda_label
+        по расписанию для позиции k.5 и при необходимости пересчёт p_pred_cached для второй половины эпохи.
     """
     if mode not in DPO_MODE_CHOICES:
         raise ValueError(f"mode должен быть один из {DPO_MODE_CHOICES}, получено: {mode!r}")
@@ -262,6 +304,167 @@ def train_dpo(
             num_workers=0,
         )
 
+        global_step = 0
+
+        def _epoch_tag_for_files(epoch_display: str) -> str:
+            return epoch_display.replace(".", "_")
+
+        def _run_validation(
+            epoch_display: str, mlflow_step: Optional[int] = None
+        ) -> float:
+            """epoch_display: '1', '1.5', ... для логов и имён артефактов. Возвращает val NLL."""
+            tag = _epoch_tag_for_files(epoch_display)
+            step_m = global_step if mlflow_step is None else mlflow_step
+            policy_model.eval()
+            val_dpo_sum = 0.0
+            val_kl_sum = 0.0
+            val_n = 0
+            with torch.no_grad():
+                for batch in tqdm(
+                    val_loader, desc=f"val DPO ep{epoch_display}", leave=False
+                ):
+                    loss, kl_b = hard_dpo_loss(
+                        batch,
+                        tokenizer,
+                        policy_model,
+                        ref_model,
+                        device,
+                        beta=beta,
+                        use_chat_template=use_chat_template,
+                    )
+                    n = len(batch["prompt"])
+                    val_dpo_sum += loss.item() * n
+                    val_kl_sum += kl_b * n
+                    val_n += n
+            val_dpo = val_dpo_sum / max(1, val_n)
+            val_kl = val_kl_sum / max(1, val_n)
+            val_nll = eval_pairwise_nll(
+                val_loader,
+                tokenizer,
+                policy_model,
+                device,
+                beta=1.0,
+                use_chat_template=use_chat_template,
+                desc=f"val NLL ep{epoch_display}",
+            )
+            val_acc = eval_pairwise_accuracy(
+                val_loader,
+                tokenizer,
+                policy_model,
+                device,
+                use_chat_template=use_chat_template,
+                desc=f"val acc ep{epoch_display}",
+            )
+
+            log_msg(f"=== Epoch {epoch_display} ===")
+            log_msg(f"validation DPO loss   : {val_dpo:.4f}")
+            log_msg(f"validation KL(π||ref) : {val_kl:.4f}")
+            log_msg(f"validation pair NLL   : {val_nll:.4f}")
+            log_msg(f"validation pair acc   : {val_acc:.4f}")
+
+            if use_mlflow:
+                mlflow.log_metric("val_dpo_loss", val_dpo, step=step_m)
+                mlflow.log_metric("val_kl_pi_ref", val_kl, step=step_m)
+                mlflow.log_metric("val_pair_nll", val_nll, step=step_m)
+                mlflow.log_metric("val_pair_acc", val_acc, step=step_m)
+                try:
+                    ef = float(epoch_display)
+                except ValueError:
+                    ef = float("nan")
+                if not math.isnan(ef):
+                    mlflow.log_metric("epoch_float", ef, step=step_m)
+
+            if (
+                val_distributions_max_batches is not None
+                and val_distributions_max_batches > 0
+                and len(val_ds) > 0
+            ):
+                dist = compute_val_delta_distributions(
+                    policy_model,
+                    ref_model,
+                    tokenizer,
+                    val_loader,
+                    device,
+                    use_chat_template=use_chat_template,
+                    max_batches=val_distributions_max_batches,
+                )
+                dt = dist["delta_theta"]
+                dr = dist["delta_ref"]
+                margin = dist["diff"]
+
+                def _val_dist_stats_line(label: str, arr: np.ndarray) -> str:
+                    if arr.size == 0:
+                        return f"{label}: (no samples)"
+                    mean = float(np.mean(arr))
+                    std = float(np.std(arr))
+                    med = float(np.median(arr))
+                    p5 = float(np.percentile(arr, 5))
+                    p95 = float(np.percentile(arr, 95))
+                    return (
+                        f"{label}: mean={mean:.2f} std={std:.2f} median={med:.2f} "
+                        f"p5={p5:.2f} p95={p95:.2f}"
+                    )
+
+                log_msg(_val_dist_stats_line("val_delta_theta  ", dt))
+                log_msg(_val_dist_stats_line("val_delta_ref    ", dr))
+                log_msg(_val_dist_stats_line("val_diff (margin)", margin))
+
+                if use_mlflow and margin.size > 0:
+                    mlflow.log_metric(
+                        "val_delta_theta_mean", float(np.mean(dt)), step=step_m
+                    )
+                    mlflow.log_metric(
+                        "val_delta_ref_mean", float(np.mean(dr)), step=step_m
+                    )
+                    mlflow.log_metric(
+                        "val_diff_mean", float(np.mean(margin)), step=step_m
+                    )
+                    mlflow.log_metric(
+                        "val_diff_std", float(np.std(margin)), step=step_m
+                    )
+
+                npz_path = os.path.join(
+                    output_dir, f"val_distributions_epoch{tag}.npz"
+                )
+                np.savez_compressed(
+                    npz_path,
+                    delta_theta=dt,
+                    delta_ref=dr,
+                    diff=margin,
+                )
+
+            if (
+                val_kl_mc_max_prompts is not None
+                and val_kl_mc_max_prompts > 0
+                and len(val_ds) > 0
+            ):
+                n_mc = min(int(val_kl_mc_max_prompts), len(val_ds))
+                mc_prompts = val_ds.select(range(n_mc))["prompt"]
+                val_kl_mc = estimate_val_kl_mc(
+                    policy_model,
+                    ref_model,
+                    tokenizer,
+                    mc_prompts,
+                    device,
+                    num_samples_per_prompt=val_kl_mc_num_samples,
+                    max_new_tokens=val_kl_mc_max_new_tokens,
+                    use_chat_template=use_chat_template,
+                    prompt_batch_size=val_kl_mc_prompt_batch_size,
+                )
+                log_msg(
+                    f"validation KL_MC (π‖ref, MC samples from policy, {n_mc} prompts × {val_kl_mc_num_samples}) : {val_kl_mc:.4f}"
+                )
+                if use_mlflow:
+                    mlflow.log_metric("val_kl_mc", val_kl_mc, step=step_m)
+
+            return val_nll
+
+        use_mid_epoch_val = (
+            mode != "hard"
+            and epochs >= 2
+            and dataset_name in ULTRAFB_MID_EPOCH_DATASETS
+        )
+
         num_training_steps = num_training_steps_override or epochs * len(train_loader)
         if use_mlflow:
             mlflow.log_param("num_training_steps", num_training_steps)
@@ -329,31 +532,24 @@ def train_dpo(
             num_training_steps=num_training_steps,
         )
 
-        global_step = 0
         best_val_nll = float("inf")
         for epoch in range(epochs):
             if mode == "hard":
-                epoch_loss_kwargs = loss_kwargs
+                epoch_loss_kw = dict(loss_kwargs)
+                mid_hook: Optional[Callable[[int], None]] = None
             else:
-                # progress_epoch = epoch / (epochs - 1) if epochs > 1 else 1.0
-                # lambda_label_epoch = max(lambda_min, 1.0 - progress_epoch)
                 if epochs > 1:
-                    progress_epoch = epoch / (epochs - 1)  # 0 ... 1
+                    progress_epoch = epoch / (epochs - 1)
                 else:
                     progress_epoch = 1.0
 
-                if lambda_schedule == "linear":
-                    lambda_label_epoch = 1.0 - (1.0 - lambda_min) * progress_epoch
-                else:  # cosine
-                    lambda_label_epoch = (
-                        lambda_min
-                        + (1.0 - lambda_min)
-                        * (1.0 + math.cos(math.pi * progress_epoch))
-                        / 2.0
-                    )
-
-                epoch_loss_kwargs = {**loss_kwargs, "lambda_label": lambda_label_epoch}
-                log_msg(f"Epoch {epoch + 1}/{epochs}, lambda_label={lambda_label_epoch:.6f}")
+                lambda_label_epoch = _lambda_label_at_progress(
+                    progress_epoch, lambda_min, lambda_schedule
+                )
+                epoch_loss_kw = {**loss_kwargs, "lambda_label": lambda_label_epoch}
+                log_msg(
+                    f"Epoch {epoch + 1}/{epochs}, lambda_label={lambda_label_epoch:.6f}"
+                )
 
                 if lambda_label_epoch < 1.0:
                     train_ds = precompute_p_pred_cached(
@@ -376,6 +572,46 @@ def train_dpo(
                         generator=g,
                     )
 
+                mid_hook = None
+                if use_mid_epoch_val and len(train_loader) >= 2:
+
+                    def mid_hook(gs: int) -> None:
+                        nonlocal train_ds, train_loader, epoch_loss_kw
+                        _run_validation(f"{epoch + 1}.5", mlflow_step=gs)
+                        prog_m = _mid_epoch_progress(epoch + 1, epochs)
+                        lambda_mid = _lambda_label_at_progress(
+                            prog_m, lambda_min, lambda_schedule
+                        )
+                        log_msg(
+                            f"Mid-epoch {epoch + 1}.5/{epochs}, "
+                            f"lambda_label={lambda_mid:.6f} (2nd half)"
+                        )
+                        epoch_loss_kw.clear()
+                        epoch_loss_kw.update(
+                            {**loss_kwargs, "lambda_label": lambda_mid}
+                        )
+                        if lambda_mid < 1.0:
+                            train_ds = precompute_p_pred_cached(
+                                train_ds,
+                                tokenizer,
+                                policy_model,
+                                ref_model,
+                                device=device,
+                                beta=beta,
+                                use_chat_template=use_chat_template,
+                                batch_size=batch_size,
+                                collate_fn=train_collate,
+                            )
+                            train_loader = DataLoader(
+                                train_ds,
+                                batch_size=batch_size,
+                                shuffle=True,
+                                collate_fn=train_collate,
+                                num_workers=0,
+                                generator=g,
+                            )
+                        policy_model.train()
+
             global_step = train_one_epoch_dpo(
                 train_loader,
                 tokenizer,
@@ -387,137 +623,14 @@ def train_dpo(
                 scheduler,
                 epoch,
                 global_step,
+                loss_kw=epoch_loss_kw,
                 log=log_msg,
-                **epoch_loss_kwargs,
+                use_mlflow=use_mlflow,
+                mid_epoch_hook=mid_hook if mode != "hard" else None,
             )
 
             policy_model.eval()
-            val_dpo_sum = 0.0
-            val_kl_sum = 0.0
-            val_n = 0
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc=f"val DPO ep{epoch+1}", leave=False):
-                    loss, kl_b = hard_dpo_loss(
-                        batch,
-                        tokenizer,
-                        policy_model,
-                        ref_model,
-                        device,
-                        beta=beta,
-                        use_chat_template=use_chat_template,
-                    )
-                    n = len(batch["prompt"])
-                    val_dpo_sum += loss.item() * n
-                    val_kl_sum += kl_b * n
-                    val_n += n
-            val_dpo = val_dpo_sum / max(1, val_n)
-            val_kl = val_kl_sum / max(1, val_n)
-            val_nll = eval_pairwise_nll(
-                val_loader,
-                tokenizer,
-                policy_model,
-                device,
-                beta=1.0,
-                use_chat_template=use_chat_template,
-                desc=f"val NLL ep{epoch+1}",
-            )
-            val_acc = eval_pairwise_accuracy(
-                val_loader,
-                tokenizer,
-                policy_model,
-                device,
-                use_chat_template=use_chat_template,
-                desc=f"val acc ep{epoch+1}",
-            )
-
-            log_msg(f"=== Epoch {epoch+1} ===")
-            log_msg(f"validation DPO loss   : {val_dpo:.4f}")
-            log_msg(f"validation KL(π||ref) : {val_kl:.4f}")
-            log_msg(f"validation pair NLL   : {val_nll:.4f}")
-            log_msg(f"validation pair acc   : {val_acc:.4f}")
-
-            if (
-                val_distributions_max_batches is not None
-                and val_distributions_max_batches > 0
-                and len(val_ds) > 0
-            ):
-                dist = compute_val_delta_distributions(
-                    policy_model,
-                    ref_model,
-                    tokenizer,
-                    val_loader,
-                    device,
-                    use_chat_template=use_chat_template,
-                    max_batches=val_distributions_max_batches,
-                )
-                dt = dist["delta_theta"]
-                dr = dist["delta_ref"]
-                margin = dist["diff"]
-
-                def _val_dist_stats_line(label: str, arr: np.ndarray) -> str:
-                    if arr.size == 0:
-                        return f"{label}: (no samples)"
-                    mean = float(np.mean(arr))
-                    std = float(np.std(arr))
-                    med = float(np.median(arr))
-                    p5 = float(np.percentile(arr, 5))
-                    p95 = float(np.percentile(arr, 95))
-                    return (
-                        f"{label}: mean={mean:.2f} std={std:.2f} median={med:.2f} "
-                        f"p5={p5:.2f} p95={p95:.2f}"
-                    )
-
-                log_msg(_val_dist_stats_line("val_delta_theta  ", dt))
-                log_msg(_val_dist_stats_line("val_delta_ref    ", dr))
-                log_msg(_val_dist_stats_line("val_diff (margin)", margin))
-
-                if use_mlflow and margin.size > 0:
-                    mlflow.log_metric(
-                        "val_delta_theta_mean", float(np.mean(dt)), step=global_step
-                    )
-                    mlflow.log_metric(
-                        "val_delta_ref_mean", float(np.mean(dr)), step=global_step
-                    )
-                    mlflow.log_metric(
-                        "val_diff_mean", float(np.mean(margin)), step=global_step
-                    )
-                    mlflow.log_metric(
-                        "val_diff_std", float(np.std(margin)), step=global_step
-                    )
-
-                npz_path = os.path.join(
-                    output_dir, f"val_distributions_epoch{epoch + 1}.npz"
-                )
-                np.savez_compressed(
-                    npz_path,
-                    delta_theta=dt,
-                    delta_ref=dr,
-                    diff=margin,
-                )
-
-            if (
-                val_kl_mc_max_prompts is not None
-                and val_kl_mc_max_prompts > 0
-                and len(val_ds) > 0
-            ):
-                n_mc = min(int(val_kl_mc_max_prompts), len(val_ds))
-                mc_prompts = val_ds.select(range(n_mc))["prompt"]
-                val_kl_mc = estimate_val_kl_mc(
-                    policy_model,
-                    ref_model,
-                    tokenizer,
-                    mc_prompts,
-                    device,
-                    num_samples_per_prompt=val_kl_mc_num_samples,
-                    max_new_tokens=val_kl_mc_max_new_tokens,
-                    use_chat_template=use_chat_template,
-                    prompt_batch_size=val_kl_mc_prompt_batch_size,
-                )
-                log_msg(
-                    f"validation KL_MC (π‖ref, MC samples from policy, {n_mc} prompts × {val_kl_mc_num_samples}) : {val_kl_mc:.4f}"
-                )
-                if use_mlflow:
-                    mlflow.log_metric("val_kl_mc", val_kl_mc, step=global_step)
+            val_nll = _run_validation(str(epoch + 1))
 
             if val_nll < best_val_nll:
                 best_val_nll = val_nll
