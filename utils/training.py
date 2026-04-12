@@ -2,9 +2,11 @@
 """
 Общий цикл обучения одной эпохи для DPO и универсальная функция train_dpo (режимы hard / soft / bayes).
 """
+import json
 import math
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import mlflow
@@ -19,6 +21,13 @@ from utils.config import MAX_FULL_LEN, MAX_PROMPT_LEN
 from utils.datasets import precompute_p_pred_cached
 from utils.loss import hard_dpo_loss, soft_dpo_loss
 from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
+from utils.capability_retention_eval import (
+    EvalRow,
+    format_capability_retention_log_lines,
+    load_eval_rows,
+    log_mlflow_capability_metrics,
+    run_retention_eval_pair,
+)
 from utils.val_distributions import compute_val_delta_distributions
 from utils.val_kl_mc import estimate_val_kl_mc
 
@@ -26,7 +35,7 @@ DPO_MODE_CHOICES = ("hard", "soft", "bayes")
 
 # Soft/Bayes-ADPO: половинная эпоха — валидация и обновление lambda / p_pred_cached.
 ULTRAFB_MID_EPOCH_DATASETS = frozenset(
-    {"openbmb", "ultrafeedback_binarized", "ultrafeedback_soft"}
+    {"openbmb", "ultrafeedback_binarized", "ultrafeedback_soft", "hh_rlhf"}
 )
 
 
@@ -202,6 +211,11 @@ def train_dpo(
     val_kl_mc_max_new_tokens: int = 128,
     val_kl_mc_prompt_batch_size: int = 6,
     val_distributions_max_batches: Optional[int] = None,
+    capability_eval_dir: Optional[str] = None,
+    capability_eval_limit: Optional[int] = None,
+    capability_eval_max_new_tokens: int = 256,
+    capability_eval_batch_size: int = 2,
+    capability_eval_max_prompt_tokens: int = 2048,
 ):
     """
     Универсальный цикл DPO: hard, soft или bayes.
@@ -222,7 +236,12 @@ def train_dpo(
     val_kl_mc_num_samples: число независимых генераций на промпт для MC.
     val_distributions_max_batches: если задано (>0), после основных val-метрик считаются распределения
         delta_theta, delta_ref, diff на первых N батчах val; лог, MLflow, np.savez_compressed в output_dir.
-    Для soft/bayes и датасетов openbmb, ultrafeedback_binarized, ultrafeedback_soft при epochs>=2:
+    capability_eval_dir: если задан (каталог с knowledge/*.jsonl и reasoning/*.jsonl), на каждой валидации
+        и в начале (epoch init) считается удержание возможностей: ref vs policy по gold; лог + JSON в output_dir;
+        ответы ref кэшируются после первой генерации. MLflow: val_cap_*.
+    capability_eval_limit: обрезка числа примеров (первые N в порядке файлов).
+    capability_eval_max_new_tokens / capability_eval_batch_size / capability_eval_max_prompt_tokens: генерация.
+    Для soft/bayes и датасетов openbmb, ultrafeedback_binarized, ultrafeedback_soft, hh_rlhf при epochs>=2:
         после первой половины батчей эпохи — валидация с меткой «1.5», «2.5», …; затем lambda_label
         по расписанию для позиции k.5 и при необходимости пересчёт p_pred_cached для второй половины эпохи.
     """
@@ -263,6 +282,11 @@ def train_dpo(
         "val_kl_mc_num_samples": val_kl_mc_num_samples,
         "val_kl_mc_max_new_tokens": val_kl_mc_max_new_tokens,
         "val_distributions_max_batches": val_distributions_max_batches,
+        "capability_eval_dir": capability_eval_dir,
+        "capability_eval_limit": capability_eval_limit,
+        "capability_eval_max_new_tokens": capability_eval_max_new_tokens,
+        "capability_eval_batch_size": capability_eval_batch_size,
+        "capability_eval_max_prompt_tokens": capability_eval_max_prompt_tokens,
     }
 
     with _mlflow_training_context(
@@ -304,10 +328,78 @@ def train_dpo(
             num_workers=0,
         )
 
+        cap_rows: Optional[List[EvalRow]] = None
+        cap_ref_cache: List[Optional[List[str]]] = [None]
+        if capability_eval_dir:
+            eval_p = Path(capability_eval_dir).expanduser().resolve()
+            if eval_p.is_dir():
+                try:
+                    cap_rows = load_eval_rows(eval_p)
+                    if capability_eval_limit is not None and capability_eval_limit > 0:
+                        cap_rows = cap_rows[: int(capability_eval_limit)]
+                    if not cap_rows:
+                        log_msg(
+                            f"capability_eval_dir={eval_p}: примеры не найдены, retention пропущен."
+                        )
+                        cap_rows = None
+                    else:
+                        log_msg(
+                            f"Capability retention: {len(cap_rows)} примеров из {eval_p} "
+                            f"(ref кэшируется после первой генерации)."
+                        )
+                except Exception as e:
+                    log_msg(f"Capability retention: ошибка загрузки eval: {e}")
+                    cap_rows = None
+            else:
+                log_msg(f"Capability retention: каталог не найден {eval_p}, пропуск.")
+
         global_step = 0
 
         def _epoch_tag_for_files(epoch_display: str) -> str:
             return epoch_display.replace(".", "_")
+
+        def _run_capability_retention(epoch_display: str, step_m: int) -> None:
+            if cap_rows is None:
+                return
+            try:
+                desc_ref = (
+                    f"cap_ret ref ep{epoch_display}"
+                    if cap_ref_cache[0] is None
+                    else None
+                )
+                summary, cap_ref_cache[0] = run_retention_eval_pair(
+                    tokenizer,
+                    ref_model,
+                    policy_model,
+                    device,
+                    cap_rows,
+                    cap_ref_cache[0],
+                    capability_eval_max_new_tokens,
+                    capability_eval_batch_size,
+                    capability_eval_max_prompt_tokens,
+                    desc_ref=desc_ref,
+                    desc_pol=f"cap_ret policy ep{epoch_display}",
+                )
+            except Exception as e:
+                log_msg(f"Capability retention: ошибка генерации/скоринга: {e}")
+                return
+            for line in format_capability_retention_log_lines(summary, epoch_display):
+                log_msg(line)
+            tag = _epoch_tag_for_files(epoch_display)
+            cap_json = os.path.join(
+                output_dir, f"capability_retention_epoch{tag}.json"
+            )
+            try:
+                with open(cap_json, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, ensure_ascii=False, indent=2)
+            except OSError as err:
+                log_msg(f"Capability retention: не удалось записать {cap_json}: {err}")
+            if use_mlflow:
+                log_mlflow_capability_metrics(
+                    summary,
+                    step_m,
+                    lambda n, v, s: mlflow.log_metric(n, v, step=s),
+                )
 
         def _run_validation(
             epoch_display: str, mlflow_step: Optional[int] = None
@@ -457,6 +549,7 @@ def train_dpo(
                 if use_mlflow:
                     mlflow.log_metric("val_kl_mc", val_kl_mc, step=step_m)
 
+            _run_capability_retention(epoch_display, step_m)
             return val_nll
 
         use_mid_epoch_val = (
@@ -524,6 +617,7 @@ def train_dpo(
         log_msg(f"validation KL(π||ref) : {init_kl:.4f}")
         log_msg(f"validation pair NLL   : {init_nll:.4f}")
         log_msg(f"validation pair acc   : {init_acc:.4f}")
+        _run_capability_retention("init", 0)
 
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
         scheduler = get_linear_schedule_with_warmup(

@@ -3,9 +3,13 @@
 Классический DPO через TRL (DPOTrainer). Те же входные параметры, что у hard_dpo_steer.
 На валидации логируются те же метрики: NLL, acc, KL (и DPO loss), как в hard_dpo_steer.
 """
+import json
 import os
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from torch.utils.data import DataLoader
@@ -22,6 +26,11 @@ from utils.datasets import (
 from utils.loss import hard_dpo_loss
 from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
 from utils.models import load_models_and_tokenizer
+from utils.capability_retention_eval import (
+    format_capability_retention_log_lines,
+    load_eval_rows,
+    run_retention_eval_pair,
+)
 from utils.training import collate_fn_hard
 
 
@@ -32,10 +41,74 @@ from utils.training import collate_fn_hard
 DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
 
 
+def _classic_capability_retention(
+    cap_rows,
+    cap_ref_holder: List[Optional[List[str]]],
+    tokenizer,
+    ref_model,
+    policy_model,
+    device: str,
+    output_dir: str,
+    epoch_display: str,
+    log_fn,
+    max_new_tokens: int,
+    batch_size: int,
+    max_prompt_tokens: int,
+) -> None:
+    if cap_rows is None or ref_model is None:
+        return
+    try:
+        desc_ref = (
+            f"cap_ret ref ep{epoch_display}"
+            if cap_ref_holder[0] is None
+            else None
+        )
+        summary, cap_ref_holder[0] = run_retention_eval_pair(
+            tokenizer,
+            ref_model,
+            policy_model,
+            device,
+            cap_rows,
+            cap_ref_holder[0],
+            max_new_tokens,
+            batch_size,
+            max_prompt_tokens,
+            desc_ref=desc_ref,
+            desc_pol=f"cap_ret policy ep{epoch_display}",
+        )
+    except Exception as e:
+        log_fn(f"Capability retention: ошибка: {e}")
+        return
+    for line in format_capability_retention_log_lines(summary, epoch_display):
+        log_fn(line)
+    tag = epoch_display.replace(".", "_")
+    cap_json = os.path.join(output_dir, f"capability_retention_epoch{tag}.json")
+    try:
+        with open(cap_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+    except OSError as err:
+        log_fn(f"Capability retention: не удалось записать {cap_json}: {err}")
+
+
 class DPOValidationMetricsCallback(TrainerCallback):
     """После каждой эпохи валидации пишет в log те же метрики, что и hard_dpo_steer: NLL, acc, KL, DPO loss."""
 
-    def __init__(self, val_ds, tokenizer, ref_model, device: str, log_fn, beta: float, eval_batch_size: int = 2):
+    def __init__(
+        self,
+        val_ds,
+        tokenizer,
+        ref_model,
+        device: str,
+        log_fn,
+        beta: float,
+        eval_batch_size: int = 2,
+        cap_rows=None,
+        cap_ref_holder: Optional[List[Optional[List[str]]]] = None,
+        cap_output_dir: Optional[str] = None,
+        cap_max_new_tokens: int = 256,
+        cap_batch_size: int = 2,
+        cap_max_prompt_tokens: int = 2048,
+    ):
         self.val_ds = val_ds
         self.tokenizer = tokenizer
         self.ref_model = ref_model
@@ -43,6 +116,12 @@ class DPOValidationMetricsCallback(TrainerCallback):
         self.log_fn = log_fn
         self.beta = beta
         self.eval_batch_size = eval_batch_size
+        self._cap_rows = cap_rows
+        self._cap_ref_holder = cap_ref_holder
+        self._cap_output_dir = cap_output_dir or "."
+        self._cap_max_new_tokens = cap_max_new_tokens
+        self._cap_batch_size = cap_batch_size
+        self._cap_max_prompt_tokens = cap_max_prompt_tokens
 
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         if model is None:
@@ -86,6 +165,21 @@ class DPOValidationMetricsCallback(TrainerCallback):
         self.log_fn(f"validation KL(π||ref) : {val_kl:.4f}")
         self.log_fn(f"validation pair NLL   : {val_nll:.4f}")
         self.log_fn(f"validation pair acc   : {val_acc:.4f}")
+        if self._cap_rows is not None and self._cap_ref_holder is not None:
+            _classic_capability_retention(
+                self._cap_rows,
+                self._cap_ref_holder,
+                self.tokenizer,
+                self.ref_model,
+                model,
+                self.device,
+                self._cap_output_dir,
+                str(epoch),
+                self.log_fn,
+                self._cap_max_new_tokens,
+                self._cap_batch_size,
+                self._cap_max_prompt_tokens,
+            )
 
 
 def main(
@@ -97,6 +191,11 @@ def main(
     batch_size: int = 8,
     lr: float = 2e-5,
     beta: float = 0.2,
+    capability_eval_dir: Optional[str] = None,
+    capability_eval_limit: Optional[int] = None,
+    capability_eval_max_new_tokens: int = 256,
+    capability_eval_batch_size: int = 2,
+    capability_eval_max_prompt_tokens: int = 2048,
 ):
     """
     resume_from: путь к чекпоинту для продолжения обучения.
@@ -158,6 +257,25 @@ def main(
     log_fn(f"beta={beta}, lr={lr}, batch_size={batch_size}, epochs=8")
     log_fn(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}")
 
+    cap_rows = None
+    cap_ref_holder: List[Optional[List[str]]] = [None]
+    if capability_eval_dir:
+        try:
+            ep = Path(capability_eval_dir).expanduser().resolve()
+            if ep.is_dir():
+                loaded = load_eval_rows(ep)
+                if capability_eval_limit is not None and capability_eval_limit > 0:
+                    loaded = loaded[: int(capability_eval_limit)]
+                if loaded:
+                    cap_rows = loaded
+                    log_fn(
+                        f"Capability retention: {len(cap_rows)} примеров из {ep} "
+                        f"(ref кэшируется после первой генерации)."
+                    )
+        except Exception as e:
+            log_fn(f"Capability retention: ошибка загрузки eval: {e}")
+            cap_rows = None
+
     # Начальная валидация — те же метрики, что в hard_dpo_steer
     val_loader_init = DataLoader(
         val_ds,
@@ -195,6 +313,20 @@ def main(
     log_fn(f"validation KL(π||ref) : {init_kl:.4f}")
     log_fn(f"validation pair NLL   : {init_nll:.4f}")
     log_fn(f"validation pair acc   : {init_acc:.4f}")
+    _classic_capability_retention(
+        cap_rows,
+        cap_ref_holder,
+        tokenizer,
+        ref_model,
+        policy_model,
+        device,
+        output_dir,
+        "init",
+        log_fn,
+        capability_eval_max_new_tokens,
+        capability_eval_batch_size,
+        capability_eval_max_prompt_tokens,
+    )
 
     validation_callback = DPOValidationMetricsCallback(
         val_ds=val_ds,
@@ -204,6 +336,12 @@ def main(
         log_fn=log_fn,
         beta=beta,
         eval_batch_size=training_args.per_device_eval_batch_size,
+        cap_rows=cap_rows,
+        cap_ref_holder=cap_ref_holder,
+        cap_output_dir=output_dir,
+        cap_max_new_tokens=capability_eval_max_new_tokens,
+        cap_batch_size=capability_eval_batch_size,
+        cap_max_prompt_tokens=capability_eval_max_prompt_tokens,
     )
 
     trainer = DPOTrainer(
@@ -241,6 +379,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    parser.add_argument(
+        "--capability-eval-dir",
+        type=str,
+        default=None,
+        help="Каталог eval_datasets: на каждой валидации лог capability retention.",
+    )
+    parser.add_argument("--capability-eval-limit", type=int, default=None)
+    parser.add_argument("--capability-eval-max-new-tokens", type=int, default=256)
+    parser.add_argument("--capability-eval-batch-size", type=int, default=2)
+    parser.add_argument("--capability-eval-max-prompt-tokens", type=int, default=2048)
     args = parser.parse_args()
     main(
         resume_from=args.resume,
@@ -251,4 +399,9 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         beta=args.beta,
+        capability_eval_dir=args.capability_eval_dir,
+        capability_eval_limit=args.capability_eval_limit,
+        capability_eval_max_new_tokens=args.capability_eval_max_new_tokens,
+        capability_eval_batch_size=args.capability_eval_batch_size,
+        capability_eval_max_prompt_tokens=args.capability_eval_max_prompt_tokens,
     )

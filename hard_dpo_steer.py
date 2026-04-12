@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
+import os
 import sys
 from typing import Optional
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -32,6 +35,11 @@ def main(
     epochs: int = 8,
     lambda_min: float = 1.0,
     use_chat_template: Optional[bool] = None,
+    capability_eval_dir: Optional[str] = None,
+    capability_eval_limit: Optional[int] = None,
+    capability_eval_max_new_tokens: int = 256,
+    capability_eval_batch_size: int = 2,
+    capability_eval_max_prompt_tokens: int = 2048,
 ):
     """
     resume_from: путь к чекпоинту (например "checkpoints/hard_dpo_steer/best").
@@ -43,6 +51,7 @@ def main(
     batch_size: размер батча для train и validation.
     lambda_min: для режима hard не используется (оставлено для единообразия CLI с soft_dpo_steer).
     use_chat_template: если None — для hh_rlhf True (PKU HH), иначе False; иначе явное значение для get_logps.
+    capability_eval_dir: если задан — на каждой валидации eval_datasets (gold), см. train_dpo.
     """
     if dataset not in DATASET_CHOICES:
         raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
@@ -92,6 +101,11 @@ def main(
         seed=seed,
         use_chat_template=use_chat_template,
         log=log_fn,
+        capability_eval_dir=capability_eval_dir,
+        capability_eval_limit=capability_eval_limit,
+        capability_eval_max_new_tokens=capability_eval_max_new_tokens,
+        capability_eval_batch_size=capability_eval_batch_size,
+        capability_eval_max_prompt_tokens=capability_eval_max_prompt_tokens,
     )
 
 
@@ -152,6 +166,36 @@ if __name__ == "__main__":
         action="store_true",
         help="Считать log p как plain prompt\\nresponse (отключить chat template, в т.ч. для hh_rlhf).",
     )
+    parser.add_argument(
+        "--capability-eval-dir",
+        type=str,
+        default=None,
+        help="Каталог eval_datasets (knowledge/*.jsonl, reasoning/*.jsonl): на каждой валидации лог retention.",
+    )
+    parser.add_argument(
+        "--capability-eval-limit",
+        type=int,
+        default=None,
+        help="Максимум примеров для retention (первые N).",
+    )
+    parser.add_argument(
+        "--capability-eval-max-new-tokens",
+        type=int,
+        default=256,
+        help="Генерация для retention (по умолчанию 256).",
+    )
+    parser.add_argument(
+        "--capability-eval-batch-size",
+        type=int,
+        default=2,
+        help="Батч генерации для retention (по умолчанию 2).",
+    )
+    parser.add_argument(
+        "--capability-eval-max-prompt-tokens",
+        type=int,
+        default=2048,
+        help="Truncation промпта для retention.",
+    )
     args = parser.parse_args()
     use_chat_template: Optional[bool] = None
     if args.use_chat_template:
@@ -170,4 +214,9 @@ if __name__ == "__main__":
         epochs=args.epochs,
         lambda_min=args.lambda_min,
         use_chat_template=use_chat_template,
+        capability_eval_dir=args.capability_eval_dir,
+        capability_eval_limit=args.capability_eval_limit,
+        capability_eval_max_new_tokens=args.capability_eval_max_new_tokens,
+        capability_eval_batch_size=args.capability_eval_batch_size,
+        capability_eval_max_prompt_tokens=args.capability_eval_max_prompt_tokens,
     )

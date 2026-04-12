@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import os
 import sys
 from typing import Optional
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -39,6 +42,11 @@ def main(
     lambda_min: float = 1.0,
     lambda_schedule: str = "linear",
     use_chat_template: Optional[bool] = None,
+    capability_eval_dir: Optional[str] = None,
+    capability_eval_limit: Optional[int] = None,
+    capability_eval_max_new_tokens: int = 256,
+    capability_eval_batch_size: int = 2,
+    capability_eval_max_prompt_tokens: int = 2048,
 ):
     """
     Soft-train + hard-validation.
@@ -126,6 +134,11 @@ def main(
         label_noise_prob=label_noise_prob,
         use_chat_template=use_chat_template,
         log=log_fn,
+        capability_eval_dir=capability_eval_dir,
+        capability_eval_limit=capability_eval_limit,
+        capability_eval_max_new_tokens=capability_eval_max_new_tokens,
+        capability_eval_batch_size=capability_eval_batch_size,
+        capability_eval_max_prompt_tokens=capability_eval_max_prompt_tokens,
     )
 
 
@@ -211,6 +224,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Считать log p как plain prompt\\nresponse (отключить chat template).",
     )
+    parser.add_argument(
+        "--capability-eval-dir",
+        type=str,
+        default=None,
+        help="Каталог eval_datasets: на каждой валидации лог capability retention (gold).",
+    )
+    parser.add_argument("--capability-eval-limit", type=int, default=None)
+    parser.add_argument("--capability-eval-max-new-tokens", type=int, default=256)
+    parser.add_argument("--capability-eval-batch-size", type=int, default=2)
+    parser.add_argument("--capability-eval-max-prompt-tokens", type=int, default=2048)
     args = parser.parse_args()
     use_chat_template: Optional[bool] = None
     if args.use_chat_template:
@@ -233,4 +256,9 @@ if __name__ == "__main__":
         lambda_min=args.lambda_min,
         lambda_schedule=args.lambda_schedule,
         use_chat_template=use_chat_template,
+        capability_eval_dir=args.capability_eval_dir,
+        capability_eval_limit=args.capability_eval_limit,
+        capability_eval_max_new_tokens=args.capability_eval_max_new_tokens,
+        capability_eval_batch_size=args.capability_eval_batch_size,
+        capability_eval_max_prompt_tokens=args.capability_eval_max_prompt_tokens,
     )

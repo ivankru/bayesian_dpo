@@ -15,6 +15,8 @@ import math
 import os
 import re
 import sys
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
