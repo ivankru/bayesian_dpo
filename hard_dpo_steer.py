@@ -15,7 +15,7 @@ from utils.datasets import (
     build_dpo_datasets_ultrafeedback,
 )
 from utils.models import load_models_and_tokenizer
-from utils.training import train_dpo
+from utils.training import DEFAULT_VAL_KL_MC_MAX_PROMPTS, train_dpo
 
 
 # ======================
@@ -40,6 +40,7 @@ def main(
     capability_eval_max_new_tokens: int = 256,
     capability_eval_batch_size: int = 2,
     capability_eval_max_prompt_tokens: int = 2048,
+    val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
 ):
     """
     resume_from: путь к чекпоинту (например "checkpoints/hard_dpo_steer/best").
@@ -106,6 +107,7 @@ def main(
         capability_eval_max_new_tokens=capability_eval_max_new_tokens,
         capability_eval_batch_size=capability_eval_batch_size,
         capability_eval_max_prompt_tokens=capability_eval_max_prompt_tokens,
+        val_kl_mc_max_prompts=val_kl_mc_max_prompts,
     )
 
 
@@ -196,6 +198,15 @@ if __name__ == "__main__":
         default=2048,
         help="Truncation промпта для retention.",
     )
+    parser.add_argument(
+        "--val-kl-mc-max-prompts",
+        type=int,
+        default=DEFAULT_VAL_KL_MC_MAX_PROMPTS,
+        help=(
+            "MC-оценка forward KL(π‖ref) на val: первые N промптов; 0 — отключить "
+            f"(по умолчанию {DEFAULT_VAL_KL_MC_MAX_PROMPTS})."
+        ),
+    )
     args = parser.parse_args()
     use_chat_template: Optional[bool] = None
     if args.use_chat_template:
@@ -219,4 +230,5 @@ if __name__ == "__main__":
         capability_eval_max_new_tokens=args.capability_eval_max_new_tokens,
         capability_eval_batch_size=args.capability_eval_batch_size,
         capability_eval_max_prompt_tokens=args.capability_eval_max_prompt_tokens,
+        val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,
     )

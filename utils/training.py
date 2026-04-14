@@ -33,6 +33,9 @@ from utils.val_kl_mc import estimate_val_kl_mc
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
 
+# MC forward KL(π‖ref) по сэмплам с π_θ; min(N, len(val)) промптов. 0 в val_kl_mc_max_prompts — отключить.
+DEFAULT_VAL_KL_MC_MAX_PROMPTS = 256
+
 # Soft/Bayes-ADPO: половинная эпоха — валидация и обновление lambda / p_pred_cached.
 ULTRAFB_MID_EPOCH_DATASETS = frozenset(
     {"openbmb", "ultrafeedback_binarized", "ultrafeedback_soft", "hh_rlhf"}
@@ -108,7 +111,7 @@ def collate_fn_soft(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def train_one_epoch_dpo(
-    train_loader,
+    train_loader_box: List[DataLoader],
     tokenizer,
     policy_model,
     ref_model,
@@ -126,17 +129,22 @@ def train_one_epoch_dpo(
     """
     Одна эпоха DPO. loss_fn(..., **loss_kw) возвращает (loss, kl_approx).
     loss_kw изменяется in-place (например lambda_label после mid_epoch_hook).
+    train_loader_box: список из одного DataLoader; mid_epoch_hook может заменить [0]
+    на новый лоадер (датасет с p_pred_cached) — цикл обязан взять новый итератор.
+
     mid_epoch_hook(global_step): после len(loader)//2 батчей (если батчей >= 2) один раз.
     """
     policy_model.train()
     running_loss = 0.0
     running_kl = 0.0
     log_interval = 100
-    n_total = len(train_loader)
+    loader = train_loader_box[0]
+    n_total = len(loader)
     n_first = n_total // 2
     batches_done = 0
 
-    for batch in train_loader:
+    def process_batch(batch) -> None:
+        nonlocal global_step, running_loss, running_kl, batches_done
         optimizer.zero_grad(set_to_none=True)
         loss, kl_batch = loss_fn(
             batch, tokenizer, policy_model, ref_model, device, **loss_kw
@@ -150,15 +158,6 @@ def train_one_epoch_dpo(
         running_kl += kl_batch
         global_step += 1
         batches_done += 1
-
-        if (
-            mid_epoch_hook is not None
-            and n_total >= 2
-            and batches_done == n_first
-            and batches_done < n_total
-        ):
-            mid_epoch_hook(global_step)
-            mid_epoch_hook = None
 
         if global_step % 1000 == 0:
             lr_cur = optimizer.param_groups[0]["lr"]
@@ -175,6 +174,29 @@ def train_one_epoch_dpo(
                 mlflow.log_metric("train_kl_pi_ref", running_kl / n, step=global_step)
             running_loss = 0.0
             running_kl = 0.0
+
+    split_mid = (
+        mid_epoch_hook is not None
+        and n_total >= 2
+        and 0 < n_first < n_total
+    )
+    if not split_mid:
+        for batch in loader:
+            process_batch(batch)
+        return global_step
+
+    it = iter(loader)
+    loader_before_mid = loader
+    for _ in range(n_first):
+        process_batch(next(it))
+
+    mid_epoch_hook(global_step)
+    if train_loader_box[0] is not loader_before_mid:
+        loader = train_loader_box[0]
+        it = iter(loader)
+
+    for _ in range(n_total - n_first):
+        process_batch(next(it))
 
     return global_step
 
@@ -206,7 +228,7 @@ def train_dpo(
     mlflow_experiment: str = "bayesian_dpo",
     mlflow_run_name: Optional[str] = None,
     mlflow_tracking_uri: Optional[str] = None,
-    val_kl_mc_max_prompts: Optional[int] = None,
+    val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
     val_kl_mc_num_samples: int = 4,
     val_kl_mc_max_new_tokens: int = 128,
     val_kl_mc_prompt_batch_size: int = 6,
@@ -231,8 +253,8 @@ def train_dpo(
     label_noise_prob: вероятность шума меток при сборке soft train (--label-noise-prob); для hard не задаётся (в логе N/A).
     use_chat_template: если True, get_logps использует tokenizer.apply_chat_template (Qwen-Instruct); иначе plain prompt\\nresponse.
     use_mlflow: логировать параметры, метрики и train.log в MLflow (tracking URI из mlflow_tracking_uri или окружения по умолчанию).
-    val_kl_mc_max_prompts: если задано (>0), в конце каждой эпохи считается MC-оценка KL(π‖ref) по сэмплам π_θ
-          на первых N промптах val (см. utils.val_kl_mc.estimate_val_kl_mc); лог: val_kl_mc, метрика MLflow при use_mlflow.
+    val_kl_mc_max_prompts: если >0 (по умолчанию DEFAULT_VAL_KL_MC_MAX_PROMPTS), в конце каждой эпохи считается MC-оценка KL(π‖ref) по сэмплам π_θ
+          на первых min(N, len(val)) промптах val (см. utils.val_kl_mc.estimate_val_kl_mc); лог: val_kl_mc, метрика MLflow при use_mlflow. 0 — отключить.
     val_kl_mc_num_samples: число независимых генераций на промпт для MC.
     val_distributions_max_batches: если задано (>0), после основных val-метрик считаются распределения
         delta_theta, delta_ref, diff на первых N батчах val; лог, MLflow, np.savez_compressed в output_dir.
@@ -525,29 +547,37 @@ def train_dpo(
                     diff=margin,
                 )
 
-            if (
-                val_kl_mc_max_prompts is not None
-                and val_kl_mc_max_prompts > 0
-                and len(val_ds) > 0
-            ):
+            if val_kl_mc_max_prompts > 0 and len(val_ds) > 0:
                 n_mc = min(int(val_kl_mc_max_prompts), len(val_ds))
-                mc_prompts = val_ds.select(range(n_mc))["prompt"]
-                val_kl_mc = estimate_val_kl_mc(
-                    policy_model,
-                    ref_model,
-                    tokenizer,
-                    mc_prompts,
-                    device,
-                    num_samples_per_prompt=val_kl_mc_num_samples,
-                    max_new_tokens=val_kl_mc_max_new_tokens,
-                    use_chat_template=use_chat_template,
-                    prompt_batch_size=val_kl_mc_prompt_batch_size,
-                )
                 log_msg(
-                    f"validation KL_MC (π‖ref, MC samples from policy, {n_mc} prompts × {val_kl_mc_num_samples}) : {val_kl_mc:.4f}"
+                    f"validation KL_MC: computing (first {n_mc} val prompts × {val_kl_mc_num_samples} samples)..."
                 )
-                if use_mlflow:
-                    mlflow.log_metric("val_kl_mc", val_kl_mc, step=step_m)
+                try:
+                    mc_prompts = val_ds.select(range(n_mc))["prompt"]
+                    val_kl_mc = estimate_val_kl_mc(
+                        policy_model,
+                        ref_model,
+                        tokenizer,
+                        mc_prompts,
+                        device,
+                        num_samples_per_prompt=val_kl_mc_num_samples,
+                        max_new_tokens=val_kl_mc_max_new_tokens,
+                        use_chat_template=use_chat_template,
+                        prompt_batch_size=val_kl_mc_prompt_batch_size,
+                    )
+                    log_msg(
+                        f"validation KL_MC (π‖ref, MC samples from policy, {n_mc} prompts × {val_kl_mc_num_samples}) : {val_kl_mc:.4f}"
+                    )
+                    if use_mlflow:
+                        mlflow.log_metric("val_kl_mc", val_kl_mc, step=step_m)
+                except Exception as e:
+                    log_msg(
+                        f"validation KL_MC: FAILED ({type(e).__name__}: {e}); continuing without val_kl_mc metric"
+                    )
+            elif val_kl_mc_max_prompts <= 0:
+                log_msg("validation KL_MC: skipped (val_kl_mc_max_prompts<=0).")
+            elif len(val_ds) == 0:
+                log_msg("validation KL_MC: skipped (empty val_ds).")
 
             _run_capability_retention(epoch_display, step_m)
             return val_nll
@@ -571,6 +601,10 @@ def train_dpo(
             f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, epochs={epochs}, lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, label_noise_prob={_lnp}, seed={seed}"
         )
         log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
+        log_msg(
+            f"val_KL_MC: max_prompts={val_kl_mc_max_prompts}, samples_per_prompt={val_kl_mc_num_samples}, "
+            f"max_new_tokens={val_kl_mc_max_new_tokens} (max_prompts=0 disables MC-KL after each epoch val)"
+        )
 
         # Начальная валидация (hard)
         policy_model.eval()
@@ -668,9 +702,10 @@ def train_dpo(
 
                 mid_hook = None
                 if use_mid_epoch_val and len(train_loader) >= 2:
+                    train_loader_box: List[DataLoader] = [train_loader]
 
                     def mid_hook(gs: int) -> None:
-                        nonlocal train_ds, train_loader, epoch_loss_kw
+                        nonlocal train_ds, epoch_loss_kw
                         _run_validation(f"{epoch + 1}.5", mlflow_step=gs)
                         prog_m = _mid_epoch_progress(epoch + 1, epochs)
                         lambda_mid = _lambda_label_at_progress(
@@ -696,7 +731,7 @@ def train_dpo(
                                 batch_size=batch_size,
                                 collate_fn=train_collate,
                             )
-                            train_loader = DataLoader(
+                            train_loader_box[0] = DataLoader(
                                 train_ds,
                                 batch_size=batch_size,
                                 shuffle=True,
@@ -705,9 +740,14 @@ def train_dpo(
                                 generator=g,
                             )
                         policy_model.train()
+                else:
+                    train_loader_box = [train_loader]
+
+            if mode == "hard":
+                train_loader_box = [train_loader]
 
             global_step = train_one_epoch_dpo(
-                train_loader,
+                train_loader_box,
                 tokenizer,
                 policy_model,
                 ref_model,
@@ -722,6 +762,7 @@ def train_dpo(
                 use_mlflow=use_mlflow,
                 mid_epoch_hook=mid_hook if mode != "hard" else None,
             )
+            train_loader = train_loader_box[0]
 
             policy_model.eval()
             val_nll = _run_validation(str(epoch + 1))

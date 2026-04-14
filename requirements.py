@@ -13,3 +13,9 @@ mlflow>=2.8.0
 
 # Опционально, для официального alpaca_eval (--alpaca-eval-lib):
 # alpaca-eval>=0.6.6
+
+# Опционально, для ifeval_run.py (Google IFEval, скачиваемый в ~/.cache/soft_dpo/ifeval/):
+# absl-py>=1.0.0
+# langdetect>=1.0.9
+# nltk>=3.8.1
+# immutabledict>=2.0.0
