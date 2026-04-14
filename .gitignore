@@ -37,4 +37,5 @@
 
 # Папки с результатами и данными
 alpaca2/
+ifeval2/
 checkpoints/
