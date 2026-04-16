@@ -7,14 +7,14 @@
 # Исключение: отслеживать .py файлы
 !*.py
 
-# Локальный CLI capability retention не в репозитории (логика в utils/capability_retention_eval.py)
+# Локальный CLI capability retention не в репозитории (логика в utils/metrics/capability_retention_eval.py)
 /eval_capability_retention.py
 
 # Исключение: папка utils (содержит .py)
 !utils/
 !utils/*.py
-# Явно в репозитории (не игнорировать даже при ужесточении правил выше)
-!utils/capability_retention_eval.py
+!utils/metrics/
+!utils/metrics/*.py
 !utils/datasets/
 !utils/datasets/*.py
 !utils/seed.py
