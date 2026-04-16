@@ -20,16 +20,23 @@ from tqdm import tqdm
 from utils.config import MAX_FULL_LEN, MAX_PROMPT_LEN
 from utils.datasets import precompute_p_pred_cached
 from utils.loss import hard_dpo_loss, soft_dpo_loss
-from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
-from utils.capability_retention_eval import (
+from utils.metrics import (
     EvalRow,
+    aggregate_anchor_alignment_window,
+    build_ref_cache_metadata,
+    estimate_val_response_entropy,
+    estimate_val_kl_mc,
+    eval_pairwise_accuracy,
+    eval_pairwise_nll,
+    format_anchor_alignment_log,
     format_capability_retention_log_lines,
     load_eval_rows,
+    load_ref_texts_cache_if_compatible,
     log_mlflow_capability_metrics,
     run_retention_eval_pair,
+    save_ref_texts_cache,
 )
 from utils.val_distributions import compute_val_delta_distributions
-from utils.val_kl_mc import estimate_val_kl_mc
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
 
@@ -142,13 +149,24 @@ def train_one_epoch_dpo(
     n_total = len(loader)
     n_first = n_total // 2
     batches_done = 0
+    align_gap_parts: List[np.ndarray] = []
+    align_ts_parts: List[np.ndarray] = []
 
     def process_batch(batch) -> None:
         nonlocal global_step, running_loss, running_kl, batches_done
         optimizer.zero_grad(set_to_none=True)
-        loss, kl_batch = loss_fn(
-            batch, tokenizer, policy_model, ref_model, device, **loss_kw
-        )
+        out = loss_fn(batch, tokenizer, policy_model, ref_model, device, **loss_kw)
+        if len(out) == 3:
+            loss, kl_batch, soft_diag = out
+            if isinstance(soft_diag, dict):
+                ts = soft_diag.get("target_shift")
+                if ts is not None and ts.size:
+                    align_ts_parts.append(ts)
+                ga = soft_diag.get("gap_abs")
+                if ga is not None and ga.size:
+                    align_gap_parts.append(ga)
+        else:
+            loss, kl_batch = out
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
         optimizer.step()
@@ -167,11 +185,22 @@ def train_one_epoch_dpo(
         if global_step % log_interval == 0:
             n = log_interval
             log(
-                f"[epoch {epoch+1}] step {global_step} train_loss={running_loss / n:.4f} kl_pi_ref={running_kl / n:.4f}"
+                f"[epoch {epoch+1}] step {global_step} train_loss={running_loss / n:.4f} train_logp_gap_mean={running_kl / n:.4f}"
             )
             if use_mlflow:
                 mlflow.log_metric("train_loss", running_loss / n, step=global_step)
-                mlflow.log_metric("train_kl_pi_ref", running_kl / n, step=global_step)
+                mlflow.log_metric("train_logp_gap_mean", running_kl / n, step=global_step)
+            if align_ts_parts:
+                align_m = aggregate_anchor_alignment_window(
+                    align_gap_parts, align_ts_parts
+                )
+                log(format_anchor_alignment_log(align_m))
+                if use_mlflow:
+                    for k, v in align_m.items():
+                        if v == v:  # not NaN
+                            mlflow.log_metric(f"train_{k}", v, step=global_step)
+                align_gap_parts.clear()
+                align_ts_parts.clear()
             running_loss = 0.0
             running_kl = 0.0
 
@@ -232,12 +261,17 @@ def train_dpo(
     val_kl_mc_num_samples: int = 4,
     val_kl_mc_max_new_tokens: int = 128,
     val_kl_mc_prompt_batch_size: int = 6,
+    val_entropy_max_prompts: int = 512,
+    val_entropy_num_samples: int = 4,
+    val_entropy_max_new_tokens: int = 128,
+    val_entropy_prompt_batch_size: int = 6,
     val_distributions_max_batches: Optional[int] = None,
     capability_eval_dir: Optional[str] = None,
     capability_eval_limit: Optional[int] = None,
     capability_eval_max_new_tokens: int = 256,
     capability_eval_batch_size: int = 2,
     capability_eval_max_prompt_tokens: int = 2048,
+    capability_ref_cache_path: Optional[str] = None,
 ):
     """
     Универсальный цикл DPO: hard, soft или bayes.
@@ -254,8 +288,12 @@ def train_dpo(
     use_chat_template: если True, get_logps использует tokenizer.apply_chat_template (Qwen-Instruct); иначе plain prompt\\nresponse.
     use_mlflow: логировать параметры, метрики и train.log в MLflow (tracking URI из mlflow_tracking_uri или окружения по умолчанию).
     val_kl_mc_max_prompts: если >0 (по умолчанию DEFAULT_VAL_KL_MC_MAX_PROMPTS), в конце каждой эпохи считается MC-оценка KL(π‖ref) по сэмплам π_θ
-          на первых min(N, len(val)) промптах val (см. utils.val_kl_mc.estimate_val_kl_mc); лог: val_kl_mc, метрика MLflow при use_mlflow. 0 — отключить.
+          на первых min(N, len(val)) промптах val (см. utils.metrics.estimate_val_kl_mc); лог: val_kl_mc, метрика MLflow при use_mlflow. 0 — отключить.
     val_kl_mc_num_samples: число независимых генераций на промпт для MC.
+    val_entropy_max_prompts: если >0, в конце каждой эпохи считается средняя токенная энтропия ответов policy
+          по первым min(L, T_resp) токенам и агрегируется по prompt'ам; 0 — отключить.
+    val_entropy_num_samples: число независимых генераций на prompt для оценки энтропии.
+    val_entropy_max_new_tokens: L, ограничение на первые токены ответа для энтропии.
     val_distributions_max_batches: если задано (>0), после основных val-метрик считаются распределения
         delta_theta, delta_ref, diff на первых N батчах val; лог, MLflow, np.savez_compressed в output_dir.
     capability_eval_dir: если задан (каталог с knowledge/*.jsonl и reasoning/*.jsonl), на каждой валидации
@@ -263,6 +301,8 @@ def train_dpo(
         ответы ref кэшируются после первой генерации. MLflow: val_cap_*.
     capability_eval_limit: обрезка числа примеров (первые N в порядке файлов).
     capability_eval_max_new_tokens / capability_eval_batch_size / capability_eval_max_prompt_tokens: генерация.
+    capability_ref_cache_path: путь к JSON-кэшу ref ответов для retention.
+        Если не задан, используется {capability_eval_dir}/ref_cache/<safe_model_name>_ref_texts.json.
     Для soft/bayes и датасетов openbmb, ultrafeedback_binarized, ultrafeedback_soft, hh_rlhf при epochs>=2:
         после первой половины батчей эпохи — валидация с меткой «1.5», «2.5», …; затем lambda_label
         по расписанию для позиции k.5 и при необходимости пересчёт p_pred_cached для второй половины эпохи.
@@ -303,6 +343,10 @@ def train_dpo(
         "val_kl_mc_max_prompts": val_kl_mc_max_prompts,
         "val_kl_mc_num_samples": val_kl_mc_num_samples,
         "val_kl_mc_max_new_tokens": val_kl_mc_max_new_tokens,
+        "val_entropy_max_prompts": val_entropy_max_prompts,
+        "val_entropy_num_samples": val_entropy_num_samples,
+        "val_entropy_max_new_tokens": val_entropy_max_new_tokens,
+        "val_entropy_prompt_batch_size": val_entropy_prompt_batch_size,
         "val_distributions_max_batches": val_distributions_max_batches,
         "capability_eval_dir": capability_eval_dir,
         "capability_eval_limit": capability_eval_limit,
@@ -352,6 +396,27 @@ def train_dpo(
 
         cap_rows: Optional[List[EvalRow]] = None
         cap_ref_cache: List[Optional[List[str]]] = [None]
+        cap_ref_cache_path_obj: Optional[Path] = None
+        cap_ref_cache_meta: Optional[Dict[str, Any]] = None
+
+        def _safe_tokenizer_name_or_path() -> str:
+            v = getattr(tokenizer, "name_or_path", None)
+            if isinstance(v, str) and v.strip():
+                return v
+            return "N/A"
+
+        def _safe_ref_model_revision() -> str:
+            cfg = getattr(ref_model, "config", None)
+            if cfg is None:
+                return "N/A"
+            rev = getattr(cfg, "_commit_hash", None)
+            if isinstance(rev, str) and rev.strip():
+                return rev
+            rev2 = getattr(cfg, "revision", None)
+            if isinstance(rev2, str) and rev2.strip():
+                return rev2
+            return "N/A"
+
         if capability_eval_dir:
             eval_p = Path(capability_eval_dir).expanduser().resolve()
             if eval_p.is_dir():
@@ -365,6 +430,34 @@ def train_dpo(
                         )
                         cap_rows = None
                     else:
+                        safe_model = (model_name or "unknown_model").replace("/", "__")
+                        if capability_ref_cache_path:
+                            cap_ref_cache_path_obj = Path(capability_ref_cache_path).expanduser().resolve()
+                        else:
+                            cap_ref_cache_path_obj = (
+                                eval_p / "ref_cache" / f"{safe_model}_ref_texts.json"
+                            )
+                        cap_ref_cache_meta = build_ref_cache_metadata(
+                            cap_rows,
+                            model_name=model_name or "N/A",
+                            tokenizer_name_or_path=_safe_tokenizer_name_or_path(),
+                            ref_model_revision=_safe_ref_model_revision(),
+                            max_new_tokens=capability_eval_max_new_tokens,
+                            max_prompt_tokens=capability_eval_max_prompt_tokens,
+                            use_chat_template=use_chat_template,
+                        )
+                        loaded, reason = load_ref_texts_cache_if_compatible(
+                            cap_ref_cache_path_obj, cap_ref_cache_meta
+                        )
+                        if loaded is not None:
+                            cap_ref_cache[0] = loaded
+                            log_msg(
+                                f"Capability retention: loaded ref cache ({len(loaded)} responses) from {cap_ref_cache_path_obj} [{reason}]"
+                            )
+                        else:
+                            log_msg(
+                                f"Capability retention: ref cache miss at {cap_ref_cache_path_obj} [{reason}]"
+                            )
                         log_msg(
                             f"Capability retention: {len(cap_rows)} примеров из {eval_p} "
                             f"(ref кэшируется после первой генерации)."
@@ -405,11 +498,30 @@ def train_dpo(
             except Exception as e:
                 log_msg(f"Capability retention: ошибка генерации/скоринга: {e}")
                 return
+            if (
+                cap_ref_cache_path_obj is not None
+                and cap_ref_cache_meta is not None
+                and cap_ref_cache[0] is not None
+            ):
+                try:
+                    save_ref_texts_cache(
+                        cap_ref_cache_path_obj, cap_ref_cache_meta, cap_ref_cache[0]
+                    )
+                except Exception as err:
+                    log_msg(
+                        f"Capability retention: failed to save ref cache {cap_ref_cache_path_obj}: {err}"
+                    )
+                else:
+                    log_msg(
+                        f"Capability retention: ref cache saved to {cap_ref_cache_path_obj}"
+                    )
             for line in format_capability_retention_log_lines(summary, epoch_display):
                 log_msg(line)
             tag = _epoch_tag_for_files(epoch_display)
+            cap_ret_dir = os.path.join(output_dir, "capability_retention")
+            os.makedirs(cap_ret_dir, exist_ok=True)
             cap_json = os.path.join(
-                output_dir, f"capability_retention_epoch{tag}.json"
+                cap_ret_dir, f"capability_retention_epoch{tag}.json"
             )
             try:
                 with open(cap_json, "w", encoding="utf-8") as f:
@@ -472,13 +584,13 @@ def train_dpo(
 
             log_msg(f"=== Epoch {epoch_display} ===")
             log_msg(f"validation DPO loss   : {val_dpo:.4f}")
-            log_msg(f"validation KL(π||ref) : {val_kl:.4f}")
+            log_msg(f"validation val_logp_gap_mean : {val_kl:.4f}")
             log_msg(f"validation pair NLL   : {val_nll:.4f}")
             log_msg(f"validation pair acc   : {val_acc:.4f}")
 
             if use_mlflow:
                 mlflow.log_metric("val_dpo_loss", val_dpo, step=step_m)
-                mlflow.log_metric("val_kl_pi_ref", val_kl, step=step_m)
+                mlflow.log_metric("val_logp_gap_mean", val_kl, step=step_m)
                 mlflow.log_metric("val_pair_nll", val_nll, step=step_m)
                 mlflow.log_metric("val_pair_acc", val_acc, step=step_m)
                 try:
@@ -579,6 +691,49 @@ def train_dpo(
             elif len(val_ds) == 0:
                 log_msg("validation KL_MC: skipped (empty val_ds).")
 
+            if val_entropy_max_prompts > 0 and len(val_ds) > 0:
+                n_ent = min(int(val_entropy_max_prompts), len(val_ds))
+                log_msg(
+                    "validation response entropy: computing "
+                    f"(first {n_ent} val prompts × {val_entropy_num_samples} samples, "
+                    f"L={val_entropy_max_new_tokens})..."
+                )
+                try:
+                    ent_prompts = val_ds.select(range(n_ent))["prompt"]
+                    ent_stats = estimate_val_response_entropy(
+                        policy_model,
+                        tokenizer,
+                        ent_prompts,
+                        device,
+                        num_samples_per_prompt=val_entropy_num_samples,
+                        max_new_tokens=val_entropy_max_new_tokens,
+                        entropy_tokens_limit=val_entropy_max_new_tokens,
+                        use_chat_template=use_chat_template,
+                        prompt_batch_size=val_entropy_prompt_batch_size,
+                    )
+                    log_msg(
+                        "validation response entropy "
+                        f"(L={val_entropy_max_new_tokens}, {n_ent} prompts × {val_entropy_num_samples}) : "
+                        f"mean={ent_stats['mean']:.4f} median={ent_stats['median']:.4f} "
+                        f"p10={ent_stats['p10']:.4f} p90={ent_stats['p90']:.4f}"
+                    )
+                    if use_mlflow:
+                        mlflow.log_metric("val_resp_entropy_mean", ent_stats["mean"], step=step_m)
+                        mlflow.log_metric(
+                            "val_resp_entropy_median", ent_stats["median"], step=step_m
+                        )
+                        mlflow.log_metric("val_resp_entropy_p10", ent_stats["p10"], step=step_m)
+                        mlflow.log_metric("val_resp_entropy_p90", ent_stats["p90"], step=step_m)
+                except Exception as e:
+                    log_msg(
+                        "validation response entropy: FAILED "
+                        f"({type(e).__name__}: {e}); continuing without response entropy metric"
+                    )
+            elif val_entropy_max_prompts <= 0:
+                log_msg("validation response entropy: skipped (val_entropy_max_prompts<=0).")
+            elif len(val_ds) == 0:
+                log_msg("validation response entropy: skipped (empty val_ds).")
+
             _run_capability_retention(epoch_display, step_m)
             return val_nll
 
@@ -604,6 +759,12 @@ def train_dpo(
         log_msg(
             f"val_KL_MC: max_prompts={val_kl_mc_max_prompts}, samples_per_prompt={val_kl_mc_num_samples}, "
             f"max_new_tokens={val_kl_mc_max_new_tokens} (max_prompts=0 disables MC-KL after each epoch val)"
+        )
+        log_msg(
+            f"val_response_entropy: max_prompts={val_entropy_max_prompts}, "
+            f"samples_per_prompt={val_entropy_num_samples}, max_new_tokens={val_entropy_max_new_tokens}, "
+            f"prompt_batch_size={val_entropy_prompt_batch_size} "
+            "(max_prompts=0 disables response entropy after each epoch val)"
         )
 
         # Начальная валидация (hard)
@@ -648,7 +809,7 @@ def train_dpo(
 
         log_msg("=== Initial (before training) ===")
         log_msg(f"validation DPO loss   : {init_dpo:.4f}")
-        log_msg(f"validation KL(π||ref) : {init_kl:.4f}")
+        log_msg(f"validation val_logp_gap_mean : {init_kl:.4f}")
         log_msg(f"validation pair NLL   : {init_nll:.4f}")
         log_msg(f"validation pair acc   : {init_acc:.4f}")
         _run_capability_retention("init", 0)

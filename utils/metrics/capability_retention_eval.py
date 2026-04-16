@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Загрузка eval_datasets, генерация (chat template Qwen) и подсчёт метрик удержания
-(ref vs policy по gold). Используется train_dpo и eval_capability_retention.py.
+(ref vs policy по gold). Используется train_dpo и eval_capability_retention.py (локальный CLI).
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -148,6 +150,79 @@ def load_eval_rows(eval_dir: Path) -> List[EvalRow]:
     return rows
 
 
+def rows_fingerprint(rows: List[EvalRow]) -> str:
+    h = hashlib.sha256()
+    for row in rows:
+        h.update(row.example_id.encode("utf-8"))
+        h.update(b"\t")
+        h.update(row.prompt.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def build_ref_cache_metadata(
+    rows: List[EvalRow],
+    model_name: str,
+    tokenizer_name_or_path: str,
+    ref_model_revision: str,
+    max_new_tokens: int,
+    max_prompt_tokens: int,
+    use_chat_template: bool,
+) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "rows_count": len(rows),
+        "rows_fingerprint": rows_fingerprint(rows),
+        "model_name": model_name,
+        "tokenizer_name_or_path": tokenizer_name_or_path,
+        "ref_model_revision": ref_model_revision,
+        "max_new_tokens": int(max_new_tokens),
+        "max_prompt_tokens": int(max_prompt_tokens),
+        "use_chat_template": bool(use_chat_template),
+        "do_sample": False,
+        "temperature": None,
+    }
+
+
+def load_ref_texts_cache_if_compatible(
+    cache_path: Path, expected_metadata: Dict[str, Any]
+) -> Tuple[Optional[List[str]], str]:
+    if not cache_path.is_file():
+        return None, "cache file missing"
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        return None, f"cache read failed: {type(e).__name__}: {e}"
+
+    if not isinstance(payload, dict):
+        return None, "cache payload is not a dict"
+    meta = payload.get("metadata")
+    ref_texts = payload.get("ref_texts")
+    if not isinstance(meta, dict):
+        return None, "cache metadata missing"
+    if not isinstance(ref_texts, list) or not all(isinstance(x, str) for x in ref_texts):
+        return None, "cache ref_texts invalid"
+    if meta != expected_metadata:
+        return None, "cache metadata mismatch"
+    if len(ref_texts) != int(expected_metadata["rows_count"]):
+        return None, "cache ref_texts length mismatch"
+    return ref_texts, "cache metadata matched"
+
+
+def save_ref_texts_cache(
+    cache_path: Path, metadata: Dict[str, Any], ref_texts: List[str]
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "metadata": metadata,
+        "ref_texts": ref_texts,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def _gold_boolq(rec: Dict[str, Any]) -> str:
     v = rec["label"]
     return "yes" if (v is True or v == "True" or str(v).lower() == "true") else "no"
@@ -168,6 +243,28 @@ def _gold_arc(rec: Dict[str, Any]) -> str:
 def _parse_arc(text: str) -> Optional[str]:
     m = re.search(r"\b([A-D])\b", text.upper())
     return m.group(1) if m else None
+
+
+def _gold_aqua_rat(rec: Dict[str, Any]) -> str:
+    if "correct_label" in rec:
+        raw = rec["correct_label"]
+    else:
+        raw = rec.get("correct", "")
+    s = str(raw).strip().upper()
+    if len(s) >= 1 and s[0] in "ABCDE":
+        return s[0]
+    m = re.search(r"\b([A-E])\b", s)
+    if m:
+        return m.group(1)
+    raise ValueError(f"aqua_rat: нет метки A–E в correct_label/correct: {raw!r}")
+
+
+def _parse_aqua_rat(text: str) -> Optional[str]:
+    """Последняя буква A–E (часто финальный ответ после рассуждения)."""
+    matches = list(re.finditer(r"\b([A-E])\b", text.upper()))
+    if not matches:
+        return None
+    return matches[-1].group(1)
 
 
 def _bbh_gold_kind(label: str) -> str:
@@ -239,6 +336,8 @@ def gold_and_kind(rec: Dict[str, Any], source: str) -> Tuple[str, Any, str]:
     if "bbh" in src or rec.get("bbh_task"):
         kind, g = _gold_bbh(rec)
         return "bbh", g, f"bbh_{kind}"
+    if "aqua_rat" in src:
+        return "aqua_rat", _gold_aqua_rat(rec), "aqua_rat"
     if "gsm8k" in src:
         g = _gold_gsm8k_number(rec)
         return "gsm8k", g, "gsm8k"
@@ -256,6 +355,8 @@ def parse_prediction(text: str, parse_kind: str, rec: Dict[str, Any]) -> Optiona
         return _parse_bbh(text, "mc")
     if parse_kind == "gsm8k":
         return _parse_gsm8k_number(text)
+    if parse_kind == "aqua_rat":
+        return _parse_aqua_rat(text)
     raise ValueError(parse_kind)
 
 

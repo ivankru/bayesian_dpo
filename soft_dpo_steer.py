@@ -47,6 +47,7 @@ def main(
     capability_eval_max_new_tokens: int = 256,
     capability_eval_batch_size: int = 2,
     capability_eval_max_prompt_tokens: int = 2048,
+    capability_ref_cache_path: Optional[str] = None,
     val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
 ):
     """
@@ -140,6 +141,7 @@ def main(
         capability_eval_max_new_tokens=capability_eval_max_new_tokens,
         capability_eval_batch_size=capability_eval_batch_size,
         capability_eval_max_prompt_tokens=capability_eval_max_prompt_tokens,
+        capability_ref_cache_path=capability_ref_cache_path,
         val_kl_mc_max_prompts=val_kl_mc_max_prompts,
     )
 
@@ -237,6 +239,12 @@ if __name__ == "__main__":
     parser.add_argument("--capability-eval-batch-size", type=int, default=2)
     parser.add_argument("--capability-eval-max-prompt-tokens", type=int, default=2048)
     parser.add_argument(
+        "--capability-ref-cache-path",
+        type=str,
+        default=None,
+        help="Явный путь к JSON-кэшу ref ответов для capability retention (опционально).",
+    )
+    parser.add_argument(
         "--val-kl-mc-max-prompts",
         type=int,
         default=DEFAULT_VAL_KL_MC_MAX_PROMPTS,
@@ -272,5 +280,6 @@ if __name__ == "__main__":
         capability_eval_max_new_tokens=args.capability_eval_max_new_tokens,
         capability_eval_batch_size=args.capability_eval_batch_size,
         capability_eval_max_prompt_tokens=args.capability_eval_max_prompt_tokens,
+        capability_ref_cache_path=args.capability_ref_cache_path,
         val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,
     )

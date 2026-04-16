@@ -24,13 +24,14 @@ from utils.datasets import (
     build_dpo_datasets_ultrafeedback,
 )
 from utils.loss import hard_dpo_loss
-from utils.metrics import eval_pairwise_accuracy, eval_pairwise_nll
-from utils.models import load_models_and_tokenizer
-from utils.capability_retention_eval import (
+from utils.metrics import (
+    eval_pairwise_accuracy,
+    eval_pairwise_nll,
     format_capability_retention_log_lines,
     load_eval_rows,
     run_retention_eval_pair,
 )
+from utils.models import load_models_and_tokenizer
 from utils.training import collate_fn_hard
 
 
@@ -82,7 +83,9 @@ def _classic_capability_retention(
     for line in format_capability_retention_log_lines(summary, epoch_display):
         log_fn(line)
     tag = epoch_display.replace(".", "_")
-    cap_json = os.path.join(output_dir, f"capability_retention_epoch{tag}.json")
+    cap_ret_dir = os.path.join(output_dir, "capability_retention")
+    os.makedirs(cap_ret_dir, exist_ok=True)
+    cap_json = os.path.join(cap_ret_dir, f"capability_retention_epoch{tag}.json")
     try:
         with open(cap_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -162,7 +165,7 @@ class DPOValidationMetricsCallback(TrainerCallback):
         epoch = int(state.epoch) if state.epoch is not None else 1
         self.log_fn(f"=== Epoch {epoch} (validation) ===")
         self.log_fn(f"validation DPO loss   : {val_dpo:.4f}")
-        self.log_fn(f"validation KL(π||ref) : {val_kl:.4f}")
+        self.log_fn(f"validation val_logp_gap_mean : {val_kl:.4f}")
         self.log_fn(f"validation pair NLL   : {val_nll:.4f}")
         self.log_fn(f"validation pair acc   : {val_acc:.4f}")
         if self._cap_rows is not None and self._cap_ref_holder is not None:
@@ -310,7 +313,7 @@ def main(
     )
     log_fn("=== Initial (before training) ===")
     log_fn(f"validation DPO loss   : {init_dpo:.4f}")
-    log_fn(f"validation KL(π||ref) : {init_kl:.4f}")
+    log_fn(f"validation val_logp_gap_mean : {init_kl:.4f}")
     log_fn(f"validation pair NLL   : {init_nll:.4f}")
     log_fn(f"validation pair acc   : {init_acc:.4f}")
     _classic_capability_retention(

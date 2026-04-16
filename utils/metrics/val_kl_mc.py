@@ -12,7 +12,7 @@ from typing import List, Sequence
 import torch
 from tqdm import tqdm
 
-from utils.metrics import get_logps
+from .dpo_logps import get_logps
 
 
 def _effective_tokenizer_cap(tokenizer) -> int:

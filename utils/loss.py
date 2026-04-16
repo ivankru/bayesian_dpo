@@ -3,7 +3,7 @@
 DPO loss: hard (chosen/rejected) и soft (resp1, resp2, p / p_bayes).
 Все функции возвращают (loss, kl_approx).
 
-kl_approx: это не истинная KL(π||ref), а среднее по батчу 0.5*(mean(log π - log ref)_1 + mean(log π - log ref)_2).
+kl_approx: это не истинная KL-дивергенция KL(π||ref), а среднее по батчу 0.5*(mean(log π - log ref)_1 + mean(log π - log ref)_2).
 Считается по фиксированным ответам в батче, поэтому может быть отрицательным (π даёт меньшую массу
 этим ответам, чем ref) или очень большим при сильном дрифте — это ожидаемо.
 """
@@ -137,7 +137,7 @@ def soft_dpo_loss(
     где diff = (Δ_theta - Δ_ref).
     batch: prompt, resp1, resp2, p, p_bayes.
     lambda_label in [0, 1]: при 1.0 цель — чистые метки p_gt; иначе смешивание с p_pred_cached (учитель, посчитанный до эпохи).
-    Возвращает (loss, kl_approx).
+    Возвращает (loss, kl_approx, diag): diag — dict с numpy 1d для логов align (target_shift; gap_abs если есть p_pred_cached).
     """
     if not 0.0 <= lambda_label <= 1.0:
         raise ValueError(f"lambda_label must be in [0, 1], got {lambda_label!r}")
@@ -189,4 +189,15 @@ def soft_dpo_loss(
         + (logp_2 - logp_2_ref).mean().item()
     )
 
-    return loss, kl_approx
+    with torch.no_grad():
+        ts = (p_target.detach() - p_gt.detach()).abs().float().cpu().numpy()
+        diag: dict = {"target_shift": ts}
+        if "p_pred_cached" in batch:
+            pp = torch.as_tensor(
+                batch["p_pred_cached"], dtype=torch.float32, device=device
+            )
+            diag["gap_abs"] = (p_gt.detach() - pp.detach()).abs().float().cpu().numpy()
+        else:
+            diag["gap_abs"] = None
+
+    return loss, kl_approx, diag
