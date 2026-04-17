@@ -26,7 +26,7 @@ description: >-
 - **soft** — `soft_dpo_loss(use_bayes=False)`, батч: `resp1`, `resp2`, `p`, `p_bayes` (+ опционально `p_pred_cached`).
 - **bayes** — как soft, но `use_bayes=True` (в лоссе целевая вероятность из бета-приора).
 
-Валидация всегда **hard**: DPO loss, KL(π‖ref), pairwise NLL, pairwise accuracy. Лучший чекпоинт по **минимальному val NLL** → `output_dir/best/`.
+Валидация всегда **hard**: DPO loss, `val_logp_gap_mean` (среднее log π − log ref на chosen/rejected из val), pairwise NLL, pairwise accuracy. Лучший чекпоинт по **минимальному val NLL** → `output_dir/best/`.
 
 ## Датасеты (имена `--dataset`)
 
@@ -47,7 +47,7 @@ description: >-
 ## Логи и артефакты
 
 - Текстовый лог: `{output_dir}/train.log` (дублирует ключевые `print`).
-- При `use_mlflow`: эксперимент по умолчанию `bayesian_dpo`, метрики `train_loss`, `train_kl_pi_ref`, `lr`, параметры из `train_dpo`; артефакт — `train.log`.
+- При `use_mlflow`: эксперимент по умолчанию `bayesian_dpo`, метрики `train_loss`, `train_logp_gap_mean`, `lr`, параметры из `train_dpo`; артефакт — `train.log`.
 
 ## Окружение
 

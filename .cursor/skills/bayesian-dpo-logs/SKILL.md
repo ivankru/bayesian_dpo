@@ -23,20 +23,20 @@ description: >-
 4. `MAX_PROMPT_LEN=…, MAX_FULL_LEN=…, use_chat_template=…`.
 5. **Initial (before training)**:
    - `validation DPO loss`
-   - `validation KL(π||ref)`
+   - `validation val_logp_gap_mean`
    - `validation pair NLL`
    - `validation pair acc`
 6. Для soft/bayes с `lambda_label < 1`: строки `Epoch k/n, lambda_label=…` (расписание по эпохам).
 7. Во время эпохи каждые **100** шагов:  
-   `[epoch e] step s train_loss=… kl_pi_ref=…`
+   `[epoch e] step s train_loss=… train_logp_gap_mean=…`
 8. Каждые **1000** шагов: `step s lr=…` (и в MLflow как `lr`).
 9. После эпохи: блок `=== Epoch k ===` с теми же четырьмя валидационными метриками.
 10. Улучшение NLL: `New best NLL … -> checkpoint saved: …/best`.
 
 ## Интерпретация метрик
 
-- **train_loss / kl_pi_ref**: скользящее среднее за последние 100 шагов (не с начала прогона). Резкие всплески или NaN — смотреть lr, beta, батч, смешивание `lambda_label` / `p_pred_cached`.
-- **validation DPO loss / KL**: средние по val в hard-режиме; полезно сравнивать до/после эпох.
+- **train_loss / train_logp_gap_mean**: скользящее среднее за последние 100 шагов (не с начала прогона). Резкие всплески или NaN — смотреть lr, beta, батч, смешивание `lambda_label` / `p_pred_cached`.
+- **validation DPO loss / val_logp_gap_mean**: средние по val в hard-режиме; полезно сравнивать до/после эпох.
 - **pair NLL / pair acc**: согласованность предпочтений на val; **чекпоинт выбирается по минимальному val NLL**, не по acc.
 
 ## Типичные сигнатуры проблем

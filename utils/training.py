@@ -6,7 +6,9 @@ import json
 import math
 import os
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import mlflow
@@ -65,6 +67,27 @@ def _mid_epoch_progress(epoch_one_based: int, epochs: int) -> float:
         return 0.5
     e0 = epoch_one_based - 1  # 0-based индекс эпохи
     return min(1.0, (e0 + 0.5) / (epochs - 1))
+
+
+def _fmt_seconds(seconds: float) -> str:
+    return f"{max(0.0, float(seconds)):.2f}s"
+
+
+def _gpu_peak_memory_gb(device: torch.device) -> Optional[float]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        bytes_peak = torch.cuda.max_memory_allocated(idx)
+    except Exception:
+        return None
+    return float(bytes_peak) / (1024.0**3)
+
+
+def _fmt_mem_gb(mem_gb: Optional[float]) -> str:
+    if mem_gb is None:
+        return "n/a"
+    return f"{mem_gb:.2f} GB"
 
 
 @contextmanager
@@ -536,15 +559,26 @@ def train_dpo(
                 )
 
         def _run_validation(
-            epoch_display: str, mlflow_step: Optional[int] = None
+            epoch_display: str,
+            mlflow_step: Optional[int] = None,
+            training_seconds: Optional[float] = None,
+            training_peak_mem_gb: Optional[float] = None,
         ) -> float:
             """epoch_display: '1', '1.5', ... для логов и имён артефактов. Возвращает val NLL."""
             tag = _epoch_tag_for_files(epoch_display)
             step_m = global_step if mlflow_step is None else mlflow_step
+            t_validation_total_start = perf_counter()
+            if device.type == "cuda" and torch.cuda.is_available():
+                try:
+                    idx = device.index if device.index is not None else torch.cuda.current_device()
+                    torch.cuda.reset_peak_memory_stats(idx)
+                except Exception:
+                    pass
             policy_model.eval()
             val_dpo_sum = 0.0
             val_kl_sum = 0.0
             val_n = 0
+            t_validation_core_start = perf_counter()
             with torch.no_grad():
                 for batch in tqdm(
                     val_loader, desc=f"val DPO ep{epoch_display}", leave=False
@@ -581,8 +615,8 @@ def train_dpo(
                 use_chat_template=use_chat_template,
                 desc=f"val acc ep{epoch_display}",
             )
+            validation_core_seconds = perf_counter() - t_validation_core_start
 
-            log_msg(f"=== Epoch {epoch_display} ===")
             log_msg(f"validation DPO loss   : {val_dpo:.4f}")
             log_msg(f"validation val_logp_gap_mean : {val_kl:.4f}")
             log_msg(f"validation pair NLL   : {val_nll:.4f}")
@@ -664,6 +698,7 @@ def train_dpo(
                 log_msg(
                     f"validation KL_MC: computing (first {n_mc} val prompts × {val_kl_mc_num_samples} samples)..."
                 )
+                t_mc_kl_start = perf_counter()
                 try:
                     mc_prompts = val_ds.select(range(n_mc))["prompt"]
                     val_kl_mc = estimate_val_kl_mc(
@@ -686,10 +721,13 @@ def train_dpo(
                     log_msg(
                         f"validation KL_MC: FAILED ({type(e).__name__}: {e}); continuing without val_kl_mc metric"
                     )
+                mc_kl_seconds = perf_counter() - t_mc_kl_start
             elif val_kl_mc_max_prompts <= 0:
                 log_msg("validation KL_MC: skipped (val_kl_mc_max_prompts<=0).")
+                mc_kl_seconds = 0.0
             elif len(val_ds) == 0:
                 log_msg("validation KL_MC: skipped (empty val_ds).")
+                mc_kl_seconds = 0.0
 
             if val_entropy_max_prompts > 0 and len(val_ds) > 0:
                 n_ent = min(int(val_entropy_max_prompts), len(val_ds))
@@ -734,7 +772,26 @@ def train_dpo(
             elif len(val_ds) == 0:
                 log_msg("validation response entropy: skipped (empty val_ds).")
 
+            t_capability_start = perf_counter()
             _run_capability_retention(epoch_display, step_m)
+            capability_seconds = perf_counter() - t_capability_start
+            validation_total_seconds = perf_counter() - t_validation_total_start
+            validation_peak_mem_gb = _gpu_peak_memory_gb(device)
+
+            timing_parts = [f"validation={_fmt_seconds(validation_core_seconds)}"]
+            if training_seconds is not None:
+                timing_parts.insert(0, f"training={_fmt_seconds(training_seconds)}")
+            timing_parts.append(f"mc_kl={_fmt_seconds(mc_kl_seconds)}")
+            timing_parts.append(
+                f"capability_retention={_fmt_seconds(capability_seconds)}"
+            )
+            timing_parts.append(f"validation_total={_fmt_seconds(validation_total_seconds)}")
+            log_msg("timings: " + ", ".join(timing_parts))
+            mem_parts = []
+            if training_seconds is not None:
+                mem_parts.append(f"training={_fmt_mem_gb(training_peak_mem_gb)}")
+            mem_parts.append(f"validation={_fmt_mem_gb(validation_peak_mem_gb)}")
+            log_msg("gpu_mem_peak: " + ", ".join(mem_parts))
             return val_nll
 
         use_mid_epoch_val = (
@@ -750,6 +807,7 @@ def train_dpo(
             log_msg(f"LR schedule: num_training_steps={num_training_steps} (override)")
 
         log_msg(f"=== {mode_label} ===")
+        log_msg(f"Run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
         _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
         log_msg(
@@ -807,12 +865,13 @@ def train_dpo(
             desc="init pairwise acc",
         )
 
-        log_msg("=== Initial (before training) ===")
+        log_msg("\n=== Initial (before training) ===")
         log_msg(f"validation DPO loss   : {init_dpo:.4f}")
         log_msg(f"validation val_logp_gap_mean : {init_kl:.4f}")
         log_msg(f"validation pair NLL   : {init_nll:.4f}")
         log_msg(f"validation pair acc   : {init_acc:.4f}")
         _run_capability_retention("init", 0)
+        log_msg("")
 
         optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
         scheduler = get_linear_schedule_with_warmup(
@@ -837,6 +896,7 @@ def train_dpo(
                 )
                 epoch_loss_kw = {**loss_kwargs, "lambda_label": lambda_label_epoch}
                 log_msg(
+                    f"\n=== Epoch {epoch + 1} ===\n"
                     f"Epoch {epoch + 1}/{epochs}, lambda_label={lambda_label_epoch:.6f}"
                 )
 
@@ -867,13 +927,14 @@ def train_dpo(
 
                     def mid_hook(gs: int) -> None:
                         nonlocal train_ds, epoch_loss_kw
-                        _run_validation(f"{epoch + 1}.5", mlflow_step=gs)
+                        mid_epoch_display = f"{epoch + 0.5:.1f}"
+                        _run_validation(mid_epoch_display, mlflow_step=gs)
                         prog_m = _mid_epoch_progress(epoch + 1, epochs)
                         lambda_mid = _lambda_label_at_progress(
                             prog_m, lambda_min, lambda_schedule
                         )
                         log_msg(
-                            f"Mid-epoch {epoch + 1}.5/{epochs}, "
+                            f"Mid-epoch {mid_epoch_display}/{epochs}, "
                             f"lambda_label={lambda_mid:.6f} (2nd half)"
                         )
                         epoch_loss_kw.clear()
@@ -907,6 +968,13 @@ def train_dpo(
             if mode == "hard":
                 train_loader_box = [train_loader]
 
+            if device.type == "cuda" and torch.cuda.is_available():
+                try:
+                    idx = device.index if device.index is not None else torch.cuda.current_device()
+                    torch.cuda.reset_peak_memory_stats(idx)
+                except Exception:
+                    pass
+            t_training_start = perf_counter()
             global_step = train_one_epoch_dpo(
                 train_loader_box,
                 tokenizer,
@@ -923,10 +991,16 @@ def train_dpo(
                 use_mlflow=use_mlflow,
                 mid_epoch_hook=mid_hook if mode != "hard" else None,
             )
+            training_seconds = perf_counter() - t_training_start
+            training_peak_mem_gb = _gpu_peak_memory_gb(device)
             train_loader = train_loader_box[0]
 
             policy_model.eval()
-            val_nll = _run_validation(str(epoch + 1))
+            val_nll = _run_validation(
+                str(epoch + 1),
+                training_seconds=training_seconds,
+                training_peak_mem_gb=training_peak_mem_gb,
+            )
 
             if val_nll < best_val_nll:
                 best_val_nll = val_nll
