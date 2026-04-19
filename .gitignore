@@ -22,12 +22,6 @@
 # Исключение: сам .gitignore должен быть в репозитории
 !.gitignore
 
-# Cursor: project skills (агентские инструкции для репозитория)
-!.cursor/
-!.cursor/skills/
-!.cursor/skills/*/
-!.cursor/skills/*/SKILL.md
-
 # Папка чекпоинтов Jupyter
 .ipynb_checkpoints/
 
