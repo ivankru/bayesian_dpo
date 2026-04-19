@@ -10,6 +10,10 @@
 # Локальный CLI capability retention не в репозитории (логика в utils/metrics/capability_retention_eval.py)
 /eval_capability_retention.py
 
+# Исключение: папка config (base_config и прочие .py)
+!config/
+!config/*.py
+
 # Исключение: папка utils (содержит .py)
 !utils/
 !utils/*.py
