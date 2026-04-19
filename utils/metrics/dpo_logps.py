@@ -90,17 +90,33 @@ def get_logps(
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
 
+    # max_prompt_len должен оставлять место хотя бы под 1 токен ответа; иначе любой длинный промпт
+    # выдавал бы пустой ответный суффикс и log p = 0 (градиент и метрики молча зануляются).
+    effective_max_prompt_len = min(int(max_prompt_len), int(max_full_len) - 1)
+    if effective_max_prompt_len < 1:
+        raise ValueError(
+            f"max_full_len={max_full_len} слишком мал для max_prompt_len={max_prompt_len}: "
+            "не остаётся места под ответ."
+        )
+
     batch_input_ids: List[List[int]] = []
     batch_prefix_lens: List[int] = []
 
     for p, r in zip(prompts, responses):
         p_ids = _apply_chat_template_ids(tokenizer, p)
+        # Обрезаем prompt *слева*, сохраняя хвост chat template (…<|im_start|>assistant\n):
+        # именно конец префикса определяет условие генерации ответа, терять его нельзя.
+        if len(p_ids) > effective_max_prompt_len:
+            p_ids = p_ids[-effective_max_prompt_len:]
+
         r_ids = tokenizer(r, add_special_tokens=False)["input_ids"]
+        max_resp_len = int(max_full_len) - len(p_ids)
+        # effective_max_prompt_len <= max_full_len - 1, поэтому max_resp_len >= 1 всегда.
+        if len(r_ids) > max_resp_len:
+            r_ids = r_ids[:max_resp_len]
+
         full = p_ids + r_ids
-        if len(full) > max_full_len:
-            full = full[:max_full_len]
-        pl_orig = len(p_ids)
-        pl = min(pl_orig, len(full))
+        pl = len(p_ids)
         batch_input_ids.append(full)
         batch_prefix_lens.append(pl)
 

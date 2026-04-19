@@ -13,17 +13,23 @@ import argparse
 import json
 import math
 import os
+import random
 import re
-import sys
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def is_cuda_device(device) -> bool:
+    """True для 'cuda', 'cuda:0', torch.device('cuda', 1) и т.п."""
+    if isinstance(device, torch.device):
+        return device.type == "cuda"
+    return isinstance(device, str) and device.startswith("cuda")
 
 # URL эталонных данных AlpacaEval (instruction + output от text_davinci_003)
 ALPACA_EVAL_DATA_URL = (
@@ -66,8 +72,8 @@ Here are the outputs of the models:
 
 Now please rank the models by the quality of their answers, so that the model with rank 1 has the best output. Then return a list of the model names and ranks, i.e., produce the following output:
 [
- {{'model': 'model_1', 'rank': 1}},
- {{'model': 'model_2', 'rank': 2}}
+ {'model': 'model_1', 'rank': 1},
+ {'model': 'model_2', 'rank': 2}
 ]
 
 Your response must be a valid Python dictionary and should contain nothing else because we will directly execute it in Python. Please provide the ranking that the majority of humans would give."""
@@ -94,6 +100,7 @@ def load_alpaca_eval_data(path: Optional[str] = None) -> List[Dict[str, str]]:
             out.append({
                 "instruction": item["instruction"],
                 "output": item["output"],
+                "dataset": item.get("dataset", "helpful_base"),
             })
     return out
 
@@ -134,13 +141,14 @@ def load_alpaca_eval_v2_data(
         path_reference, ALPACA_EVAL_V2_REFERENCE_URL, "AlpacaEval 2.0 GPT-4 reference"
     )
 
-    # Нормализуем в списки {instruction, output}
+    # Нормализуем в списки {instruction, output, dataset}
     instructions_list = []
     for item in instructions_data:
         if isinstance(item, dict) and "instruction" in item:
             instructions_list.append({
                 "instruction": item["instruction"],
                 "output": item.get("output", ""),
+                "dataset": item.get("dataset", "helpful_base"),
             })
 
     ref_by_instruction: Dict[str, str] = {}
@@ -157,7 +165,7 @@ def load_alpaca_eval_v2_data(
             raise ValueError(
                 f"AlpacaEval 2.0: для инструкции не найден reference в alpaca_eval_gpt4_baseline.json: {inst[:80]}..."
             )
-        out.append({"instruction": inst, "output": ref_out})
+        out.append({"instruction": inst, "output": ref_out, "dataset": rec["dataset"]})
     return out
 
 
@@ -202,7 +210,11 @@ def load_candidate_model(
     """Загружает модель из чекпоинта (база + LoRA). Токенайзер берётся из base_model, чтобы избежать ошибок при неполных файлах в чекпоинте."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_cuda = is_cuda_device(device)
+    if use_cuda:
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        dtype = torch.float32
 
     checkpoint_arg_raw = checkpoint_dir
     ckpt_path = Path(checkpoint_arg_raw).expanduser().resolve()
@@ -216,42 +228,6 @@ def load_candidate_model(
             )
             ckpt_path = recovered
     checkpoint_dir = str(ckpt_path)
-    # #region agent log
-    try:
-        with open(
-            "/home/jovyan/kruzhilov/.cursor/debug-acece9.log",
-            "a",
-            encoding="utf-8",
-        ) as _df:
-            _df.write(
-                json.dumps(
-                    {
-                        "sessionId": "acece9",
-                        "runId": os.environ.get("DEBUG_AGENT_RUN_ID", "pre-fix"),
-                        "hypothesisId": "A-B",
-                        "location": "alpaca_eval_judge.py:load_candidate_model",
-                        "message": "checkpoint path resolution",
-                        "data": {
-                            "cwd": os.getcwd(),
-                            "raw_arg": checkpoint_arg_raw,
-                            "resolved": checkpoint_dir,
-                            "dataset_subdir_recovered": str(recovered)
-                            if recovered is not None
-                            else None,
-                            "is_dir": ckpt_path.is_dir(),
-                            "has_adapter_config": (ckpt_path / "adapter_config.json").is_file(),
-                            "has_config_json": (ckpt_path / "config.json").is_file(),
-                        },
-                        "timestamp": int(time.time() * 1000),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-    except OSError:
-        pass
-    # #endregion
-
     if not ckpt_path.is_dir():
         raise FileNotFoundError(
             f"Каталог чекпоинта не найден: {checkpoint_arg_raw!r} → {checkpoint_dir!r} "
@@ -301,7 +277,11 @@ def load_base_model(
     """Загружает базовую модель без LoRA (для оценки Qwen2.5-3B-Instruct без finetuning)."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_cuda = is_cuda_device(device)
+    if use_cuda:
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        dtype = torch.float32
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     if tokenizer.pad_token_id is None:
@@ -317,30 +297,34 @@ def load_base_model(
 
 
 def load_judge_model(device: Optional[str] = None):
-    """Загружает модель-судью Qwen2.5-14B-Instruct."""
+    """
+    Загружает модель-судью Qwen2.5-14B-Instruct.
+
+    На CUDA используем device_map='auto', чтобы Accelerate распределил веса между
+    доступными GPU (14B в bf16 ~ 28 GB не всегда влезает в одну карту). На CPU
+    — обычная загрузка.
+    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_cuda = is_cuda_device(device)
+    if use_cuda:
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        dtype = torch.float32
 
     tokenizer = AutoTokenizer.from_pretrained(JUDGE_MODEL)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
+    device_map = "auto" if use_cuda else device
     model = AutoModelForCausalLM.from_pretrained(
         JUDGE_MODEL,
         torch_dtype=dtype,
-        device_map=device,
+        device_map=device_map,
     )
     model.eval()
     return tokenizer, model, device
-
-
-def build_messages_for_generation(instruction: str) -> List[Dict[str, str]]:
-    """Сообщения в формате chat для генерации ответа на инструкцию."""
-    return [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": instruction},
-    ]
 
 
 def _clear_unsupported_generation_config(model) -> None:
@@ -349,6 +333,25 @@ def _clear_unsupported_generation_config(model) -> None:
         for key in ("top_p", "top_k"):
             if hasattr(model.generation_config, key):
                 setattr(model.generation_config, key, None)
+
+
+def _input_device_for(model, fallback) -> Any:
+    """Куда класть тензоры: при device_map='auto' это устройство embed_tokens."""
+    dev = getattr(model, "device", None)
+    if dev is not None:
+        return dev
+    return fallback
+
+
+def _build_messages_with_optional_system(
+    instruction: str, system_prompt: Optional[str] = "You are a helpful assistant."
+) -> List[Dict[str, str]]:
+    if system_prompt:
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": instruction},
+        ]
+    return [{"role": "user", "content": instruction}]
 
 
 def generate_responses(
@@ -360,15 +363,29 @@ def generate_responses(
     batch_size: int = 1,
     do_sample: bool = False,
     temperature: float = 0.6,
+    system_prompt: Optional[str] = "You are a helpful assistant.",
 ) -> List[str]:
-    """Генерирует ответы модели на список инструкций."""
+    """
+    Генерирует ответы модели на список инструкций.
+
+    Важно: для авторегрессивной генерации с padding нужно left-padding.
+    Иначе при batch_size > 1 модель видит pad-токены в середине prompt и
+    выдаёт мусор.
+    """
     model.eval()
     _clear_unsupported_generation_config(model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    input_device = _input_device_for(model, device)
     all_outputs = []
 
     for i in range(0, len(instructions), batch_size):
         batch_instructions = instructions[i : i + batch_size]
-        messages_batch = [build_messages_for_generation(inst) for inst in batch_instructions]
+        messages_batch = [
+            _build_messages_with_optional_system(inst, system_prompt)
+            for inst in batch_instructions
+        ]
 
         texts = tokenizer.apply_chat_template(
             messages_batch,
@@ -384,7 +401,7 @@ def generate_responses(
             padding=True,
             truncation=True,
             max_length=2048,
-        ).to(device)
+        ).to(input_device)
 
         with torch.no_grad():
             out = model.generate(
@@ -396,9 +413,10 @@ def generate_responses(
                 eos_token_id=tokenizer.eos_token_id,
             )
 
-        # Вырезаем только сгенерированную часть (после промпта)
-        for j, (inp_ids, out_ids) in enumerate(zip(inputs.input_ids, out)):
-            prompt_len = inp_ids.size(0)
+        # Вырезаем только сгенерированную часть. При left-padding длины prompt
+        # одинаковы для всего батча и равны inputs.input_ids.size(1).
+        prompt_len = inputs.input_ids.size(1)
+        for out_ids in out:
             gen_ids = out_ids[prompt_len:]
             text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
             all_outputs.append(text)
@@ -453,19 +471,25 @@ def run_judge(
     model,
     device: str,
     instruction: str,
-    output_baseline: str,
-    output_candidate: str,
-    model_1_name: str = "baseline",
-    model_2_name: str = "candidate",
+    output_1: str,
+    output_2: str,
     max_new_tokens: int = 96,
 ) -> Tuple[Optional[int], str]:
     """
-    Судья сравнивает output_baseline (model_1) и output_candidate (model_2).
-    Возвращает (rank_candidate, raw_response).
-    rank_candidate: 1 = candidate лучше, 2 = baseline лучше, None = не удалось распарсить.
+    Запускает судью с двумя ответами в фиксированных слотах model_1 / model_2.
+    Возвращает (rank_of_output_2, raw_response):
+      rank_of_output_2 == 1 -> output_2 лучше,
+      rank_of_output_2 == 2 -> output_1 лучше,
+      None — не удалось распарсить.
+    Решение, какой из output'ов — кандидат, принимается на уровне выше
+    (в compute_win_rate; так удобно рандомизировать порядок).
     """
-    # В шаблоне судьи имена model_1 и model_2 — подставляем наши имена в парсер не меняем, в промпте можно оставить model_1/model_2
-    messages = build_judge_messages(instruction, output_baseline, output_candidate)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    input_device = _input_device_for(model, device)
+
+    messages = build_judge_messages(instruction, output_1, output_2)
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -476,7 +500,7 @@ def run_judge(
         return_tensors="pt",
         truncation=True,
         max_length=4096,
-    ).to(device)
+    ).to(input_device)
 
     _clear_unsupported_generation_config(model)
     with torch.no_grad():
@@ -494,9 +518,7 @@ def run_judge(
 
     if ranking is None:
         return None, raw
-    # В промпте мы передаём "model_1" и "model_2"; candidate у нас был output_2 = model_2
-    rank_candidate = ranking.get("model_2")
-    return rank_candidate, raw
+    return ranking.get("model_2"), raw
 
 
 def compute_win_rate(
@@ -506,16 +528,26 @@ def compute_win_rate(
     judge_model,
     device: str,
     max_evals: Optional[int] = None,
+    randomize_order: bool = True,
+    seed: int = 0,
 ) -> Tuple[float, float, float, List[Dict[str, Any]]]:
     """
-    Запускает судью по всем парам, считает win / tie / loss.
-    Возвращает (win_rate, tie_rate, loss_rate), и список записей для отчёта.
+    Запускает судью по всем парам и считает win / tie / loss.
+
+    Чтобы убрать положенный LLM-судьям position bias (кандидат всегда
+    в одном слоте), рандомизируем порядок (model_1 vs model_2) для каждой
+    пары; нормализация — на уровне rank_candidate.
+
+    Возвращает (win_rate, tie_rate, loss_rate, results), где results — записи
+    с инструкцией, ответами, какой слот занимал кандидат, нормализованным
+    rank_candidate (1=cand лучше, 2=baseline лучше) и сырым ответом судьи.
     """
     n = len(eval_data)
     if max_evals is not None:
         n = min(n, max_evals)
     wins = ties = losses = 0
-    results = []
+    results: List[Dict[str, Any]] = []
+    rng = random.Random(seed)
 
     for i in range(n):
         item = eval_data[i]
@@ -523,18 +555,32 @@ def compute_win_rate(
         baseline_out = item["output"]
         cand_out = candidate_outputs[i]
 
-        rank_cand, raw = run_judge(
+        cand_first = randomize_order and (rng.random() < 0.5)
+        if cand_first:
+            output_1, output_2 = cand_out, baseline_out
+        else:
+            output_1, output_2 = baseline_out, cand_out
+
+        rank_output_2, raw = run_judge(
             judge_tokenizer,
             judge_model,
             device,
             inst,
-            baseline_out,
-            cand_out,
+            output_1,
+            output_2,
         )
 
-        if rank_cand == 1:
+        # Нормализуем: rank_candidate = 1, если победил кандидат, 2 — если baseline.
+        if rank_output_2 is None:
+            rank_candidate: Optional[int] = None
+        elif cand_first:
+            rank_candidate = 1 if rank_output_2 == 2 else 2
+        else:
+            rank_candidate = rank_output_2
+
+        if rank_candidate == 1:
             wins += 1
-        elif rank_cand == 2:
+        elif rank_candidate == 2:
             losses += 1
         else:
             ties += 1
@@ -544,7 +590,8 @@ def compute_win_rate(
             "instruction": inst,
             "output_baseline": baseline_out,
             "output_candidate": cand_out,
-            "rank_candidate": rank_cand,
+            "candidate_slot": "model_1" if cand_first else "model_2",
+            "rank_candidate": rank_candidate,
             "raw_judge": raw,
         })
 
@@ -568,6 +615,7 @@ def print_metrics(
     loss_rate: float,
     n: int,
     length_controlled_win_rate: Optional[float] = None,
+    length_filtered_win_rate: Optional[float] = None,
     model_name: str = "candidate",
     baseline_name: str = "baseline",
 ) -> None:
@@ -584,19 +632,31 @@ def print_metrics(
     print(f"  Tie rate:                   {tie_rate:.2%}", flush=True)
     print(f"  Loss rate:                   {loss_rate:.2%}", flush=True)
     if length_controlled_win_rate is not None:
-        print(f"  Length-controlled win rate: {length_controlled_win_rate:.2%}", flush=True)
+        print(
+            f"  Length-controlled WR (GLM): {length_controlled_win_rate:.2%}",
+            flush=True,
+        )
+    if length_filtered_win_rate is not None:
+        print(
+            f"  Length-filtered WR (heur):  {length_filtered_win_rate:.2%}",
+            flush=True,
+        )
     print("=" * 56 + "\n", flush=True)
 
 
-def compute_length_controlled_win_rate(
+def compute_length_filtered_win_rate(
     eval_data: List[Dict[str, str]],
     candidate_outputs: List[str],
     results: List[Dict[str, Any]],
     length_ratio_max: float = 1.1,
 ) -> float:
     """
-    Length-controlled win rate: только пары, где длина ответа кандидата
-    не больше чем у baseline * length_ratio_max. Использует уже посчитанные results.
+    Простой length-filtered win rate (НЕ LC-WR из AlpacaEval 2.0!):
+    оставляем только пары, где длина ответа кандидата (в символах)
+    не больше baseline * length_ratio_max, и считаем win-rate по ним.
+
+    Эвристика; для настоящей length-controlled метрики см.
+    compute_length_controlled_win_rate_glm.
     """
     wins = losses = ties = 0
     for i, item in enumerate(eval_data):
@@ -615,6 +675,156 @@ def compute_length_controlled_win_rate(
             ties += 1
     total = wins + ties + losses
     return (wins / total) if total else 0.0
+
+
+def compute_length_controlled_win_rate_glm(
+    eval_data: List[Dict[str, str]],
+    candidate_outputs: List[str],
+    results: List[Dict[str, Any]],
+    length_unit: str = "chars",
+    tokenizer=None,
+) -> Dict[str, float]:
+    """
+    Length-controlled win rate в духе AlpacaEval 2.0 (Dubois et al., 2024,
+    arXiv:2404.04475), упрощённый для пары "одна модель vs reference".
+
+    Фитим логистическую регрессию по парам:
+        logit P(candidate beats baseline | x) = theta + beta * z(len_cand - len_baseline)
+    где z(.) — стандартизация (вычитаем среднее, делим на std). Tie трактуется
+    как 0.5 (полупобеда). Длина — в символах (по умолчанию, как в оригинале)
+    либо в токенах (если передан tokenizer).
+
+    LC-WR = sigmoid(theta + beta * z(0)), т.е. предсказанный win-rate при
+    нулевой разнице длин.
+
+    Это упрощение: оригинальная alpaca_eval.metrics.glm_winrate.py добавляет
+    instruction random effect (instruction_difficulty); у нас по 1 наблюдению
+    на инструкцию, поэтому этот член тождественно нулевой.
+    """
+    import numpy as np
+
+    xs: List[float] = []
+    ys: List[float] = []
+    for i, item in enumerate(eval_data):
+        if i >= len(results):
+            break
+        rank_cand = results[i].get("rank_candidate")
+        if rank_cand == 1:
+            y = 1.0
+        elif rank_cand == 2:
+            y = 0.0
+        elif rank_cand is None:
+            continue
+        else:
+            y = 0.5
+
+        baseline_out = item["output"]
+        cand_out = candidate_outputs[i]
+        if length_unit == "tokens" and tokenizer is not None:
+            len_b = len(tokenizer.encode(baseline_out, add_special_tokens=False))
+            len_c = len(tokenizer.encode(cand_out, add_special_tokens=False))
+        else:
+            len_b = len(baseline_out)
+            len_c = len(cand_out)
+        xs.append(float(len_c - len_b))
+        ys.append(y)
+
+    n = len(ys)
+    if n == 0:
+        return {
+            "length_controlled_win_rate": 0.0,
+            "raw_win_rate": 0.0,
+            "n": 0,
+            "intercept": 0.0,
+            "length_coef": 0.0,
+            "len_diff_mean": 0.0,
+            "len_diff_std": 0.0,
+            "length_unit": length_unit,
+        }
+
+    x = np.asarray(xs, dtype=np.float64)
+    y = np.asarray(ys, dtype=np.float64)
+    raw_wr = float(np.mean(y))
+
+    mu = float(x.mean())
+    sd = float(x.std())
+    if sd < 1e-8:
+        # Разница длин константна — длина не вносит сигнал, LC-WR = raw win rate.
+        return {
+            "length_controlled_win_rate": raw_wr,
+            "raw_win_rate": raw_wr,
+            "n": n,
+            "intercept": float(np.log(max(raw_wr, 1e-8) / max(1.0 - raw_wr, 1e-8))),
+            "length_coef": 0.0,
+            "len_diff_mean": mu,
+            "len_diff_std": sd,
+            "length_unit": length_unit,
+        }
+    z = (x - mu) / sd
+
+    def neg_log_lik(params):
+        theta, beta = params
+        logits = theta + beta * z
+        # Стабильная log-likelihood Бернулли с y in [0,1]:
+        # log p(y) = y*log sigmoid(l) + (1-y)*log(1-sigmoid(l))
+        #         = -y*softplus(-l) - (1-y)*softplus(l)
+        sp_neg = np.logaddexp(0.0, -logits)  # softplus(-l)
+        sp_pos = np.logaddexp(0.0, logits)   # softplus(l)
+        return float(np.sum(y * sp_neg + (1.0 - y) * sp_pos))
+
+    def grad(params):
+        theta, beta = params
+        logits = theta + beta * z
+        # sigmoid(logits) - y
+        p = 1.0 / (1.0 + np.exp(-logits))
+        r = p - y
+        return np.array([float(r.sum()), float((r * z).sum())], dtype=np.float64)
+
+    try:
+        from scipy.optimize import minimize
+
+        res = minimize(
+            neg_log_lik,
+            x0=np.array([0.0, 0.0]),
+            jac=grad,
+            method="L-BFGS-B",
+        )
+        theta_hat, beta_hat = float(res.x[0]), float(res.x[1])
+    except Exception:
+        # Простой Newton fallback
+        theta_hat, beta_hat = 0.0, 0.0
+        for _ in range(200):
+            g = grad(np.array([theta_hat, beta_hat]))
+            if np.linalg.norm(g) < 1e-8:
+                break
+            logits = theta_hat + beta_hat * z
+            p = 1.0 / (1.0 + np.exp(-logits))
+            w = p * (1.0 - p)
+            H00 = float(w.sum())
+            H01 = float((w * z).sum())
+            H11 = float((w * z * z).sum())
+            det = H00 * H11 - H01 * H01
+            if abs(det) < 1e-12:
+                break
+            inv = np.array([[H11, -H01], [-H01, H00]]) / det
+            step = inv @ g
+            theta_hat -= float(step[0])
+            beta_hat -= float(step[1])
+
+    z0 = (0.0 - mu) / sd
+    logit0 = theta_hat + beta_hat * z0
+    lc_wr = float(1.0 / (1.0 + np.exp(-logit0)))
+
+    return {
+        "length_controlled_win_rate": lc_wr,
+        "raw_win_rate": raw_wr,
+        "n": n,
+        "intercept": theta_hat,
+        "length_coef": beta_hat,
+        "len_diff_mean": mu,
+        "len_diff_std": sd,
+        "length_unit": length_unit,
+    }
 
 
 def _run_official_alpaca_eval(
@@ -639,7 +849,11 @@ def _run_official_alpaca_eval(
 
     # reference_outputs в том же порядке, что и model_outputs (baseline из наших данных)
     reference_outputs = [
-        {"instruction": d["instruction"], "output": d["output"], "dataset": "helpful_base"}
+        {
+            "instruction": d["instruction"],
+            "output": d["output"],
+            "dataset": d.get("dataset", "helpful_base"),
+        }
         for d in eval_data
     ]
 
@@ -743,7 +957,11 @@ def main():
     parser.add_argument(
         "--length-controlled",
         action="store_true",
-        help="Дополнительно вывести length-controlled win rate.",
+        help=(
+            "Дополнительно посчитать length-controlled win rate (GLM в духе "
+            "AlpacaEval 2.0, arXiv:2404.04475) и эвристический "
+            "length-filtered win rate (фильтр по длине ответа)."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -760,6 +978,20 @@ def main():
         "--alpaca2",
         action="store_true",
         help="AlpacaEval 2.0: официальный формат данных, reference — GPT-4-turbo (alpaca_eval_gpt4_baseline.json). Сравнение: ваша модель vs GPT-4-turbo. Всегда считаются win rate и length-controlled win rate.",
+    )
+    parser.add_argument(
+        "--no-randomize-judge-order",
+        action="store_true",
+        help=(
+            "Не рандомизировать порядок (model_1/model_2) в промпте судьи. "
+            "По умолчанию рандомизация включена для борьбы с position bias."
+        ),
+    )
+    parser.add_argument(
+        "--judge-seed",
+        type=int,
+        default=0,
+        help="Seed для рандомизации порядка ответов судьи (по умолчанию 0).",
     )
     args = parser.parse_args()
 
@@ -824,14 +1056,15 @@ def main():
     )
     # Освобождаем память от модели-кандидата перед загрузкой судьи
     del cand_model
-    torch.cuda.empty_cache() if device == "cuda" else None
+    if is_cuda_device(device):
+        torch.cuda.empty_cache()
 
     # Сохраняем ответы кандидата (формат alpaca_eval: instruction, output, dataset, generator)
     model_outputs_for_lib = [
         {
             "instruction": d["instruction"],
             "output": candidate_outputs[i],
-            "dataset": "helpful_base",
+            "dataset": d.get("dataset", "helpful_base"),
             "generator": model_name_for_log,
         }
         for i, d in enumerate(eval_data)
@@ -864,7 +1097,10 @@ def main():
     # 3) Загрузка судьи и оценка (локальный Qwen2.5-14B)
     log("Loading judge model (Qwen2.5-14B-Instruct)...")
     judge_tokenizer, judge_model, _ = load_judge_model(device=device)
-    log("Running judge...")
+    randomize = not args.no_randomize_judge_order
+    log(
+        f"Running judge... (randomize_order={randomize}, judge_seed={args.judge_seed})"
+    )
     win_rate, tie_rate, loss_rate, results = compute_win_rate(
         eval_data,
         candidate_outputs,
@@ -872,11 +1108,20 @@ def main():
         judge_model,
         device,
         max_evals=None,
+        randomize_order=randomize,
+        seed=args.judge_seed,
     )
 
-    lc_wr = None
+    lc_glm: Optional[Dict[str, float]] = None
+    lc_filtered: Optional[float] = None
     if args.length_controlled or args.alpaca2:
-        lc_wr = compute_length_controlled_win_rate(
+        lc_glm = compute_length_controlled_win_rate_glm(
+            eval_data,
+            candidate_outputs,
+            results,
+            length_unit="chars",
+        )
+        lc_filtered = compute_length_filtered_win_rate(
             eval_data,
             candidate_outputs,
             results,
@@ -887,8 +1132,21 @@ def main():
     log(f"Win rate (vs {baseline_name}): {win_rate:.2%}")
     log(f"Tie rate:               {tie_rate:.2%}")
     log(f"Loss rate:              {loss_rate:.2%}")
-    if lc_wr is not None:
-        log(f"Length-controlled win rate: {lc_wr:.2%}")
+    if lc_glm is not None:
+        log(
+            "Length-controlled win rate (GLM, AlpacaEval-2-style): "
+            f"{lc_glm['length_controlled_win_rate']:.2%} "
+            f"(intercept={lc_glm['intercept']:.3f}, "
+            f"length_coef={lc_glm['length_coef']:.3f}, "
+            f"len_diff_mean={lc_glm['len_diff_mean']:.1f} {lc_glm['length_unit']}, "
+            f"len_diff_std={lc_glm['len_diff_std']:.1f} {lc_glm['length_unit']}, "
+            f"n={lc_glm['n']})"
+        )
+    if lc_filtered is not None:
+        log(
+            "Length-filtered win rate (heuristic, len_cand <= 1.1*len_baseline): "
+            f"{lc_filtered:.2%}"
+        )
 
     results_dict = {
         "win_rate": win_rate,
@@ -898,8 +1156,11 @@ def main():
         "checkpoint": model_name_for_log,
         "baseline": baseline_name,
     }
-    if lc_wr is not None:
-        results_dict["length_controlled_win_rate"] = lc_wr
+    if lc_glm is not None:
+        results_dict["length_controlled_win_rate"] = lc_glm["length_controlled_win_rate"]
+        results_dict["length_controlled_glm"] = lc_glm
+    if lc_filtered is not None:
+        results_dict["length_filtered_win_rate"] = lc_filtered
     with open(os.path.join(out_dir, "judge_results.json"), "w", encoding="utf-8") as f:
         json.dump(results_dict, f, indent=2)
     # Сохраняем примеры для разбора: инструкция, ответы, вердикт судьи
@@ -909,12 +1170,15 @@ def main():
     log(f"Judge examples (instruction, output_candidate, output_baseline, raw_judge) saved to {examples_path}")
     log(f"Results saved to {out_dir}")
 
-    print_metrics(  
+    print_metrics(
         win_rate=win_rate,
         tie_rate=tie_rate,
         loss_rate=loss_rate,
         n=n,
-        length_controlled_win_rate=lc_wr,
+        length_controlled_win_rate=(
+            lc_glm["length_controlled_win_rate"] if lc_glm is not None else None
+        ),
+        length_filtered_win_rate=lc_filtered,
         model_name=model_name_for_log,
         baseline_name=baseline_name,
     )

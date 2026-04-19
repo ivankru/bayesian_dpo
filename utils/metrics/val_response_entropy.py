@@ -15,6 +15,29 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+def _response_token_mask(gen_tail: torch.Tensor, eos_id) -> torch.Tensor:
+    """
+    [B, T] — True для токенов ответа, входящих в среднее (до первого EOS включительно;
+    если EOS в префиксе из T токенов нет — все T позиций).
+    """
+    b, t = gen_tail.shape
+    if eos_id is None:
+        return torch.ones((b, t), dtype=torch.bool, device=gen_tail.device)
+    if isinstance(eos_id, int):
+        hit = gen_tail == eos_id
+    else:
+        eos_t = torch.as_tensor(eos_id, device=gen_tail.device, dtype=gen_tail.dtype).view(1, -1)
+        hit = (gen_tail.unsqueeze(-1) == eos_t).any(dim=-1)
+    col = torch.arange(t, device=gen_tail.device).unsqueeze(0).expand(b, -1)
+    has = hit.any(dim=1, keepdim=True)
+    first = torch.where(
+        has,
+        hit.int().argmax(dim=1, keepdim=True),
+        torch.full((b, 1), t - 1, device=gen_tail.device, dtype=torch.long),
+    )
+    return col <= first
+
+
 def _effective_tokenizer_cap(tokenizer) -> int:
     """Безопасный cap для tokenizer.model_max_length."""
     cap = getattr(tokenizer, "model_max_length", None)
@@ -36,6 +59,8 @@ def estimate_val_response_entropy(
     temperature: float = 1.0,
     use_chat_template: bool = False,
     prompt_batch_size: int = 6,
+    forward_chunk_size: int = 2,
+    cuda_empty_cache_between_batches: bool = True,
     show_progress: bool = True,
 ) -> Dict[str, float]:
     """
@@ -50,6 +75,8 @@ def estimate_val_response_entropy(
         )
     if prompt_batch_size < 1:
         raise ValueError(f"prompt_batch_size must be >= 1, got {prompt_batch_size}")
+    if forward_chunk_size < 1:
+        raise ValueError(f"forward_chunk_size must be >= 1, got {forward_chunk_size}")
     if max_new_tokens < 1:
         raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
     if entropy_tokens_limit < 1:
@@ -75,13 +102,14 @@ def estimate_val_response_entropy(
 
     cap_enc = _effective_tokenizer_cap(tokenizer)
 
+    # Не используем output_scores: на части связок (Peft + Qwen + device_map / конфиг generate)
+    # `generated.scores` приходит пустым, и метрика превращается в NaN. Энтропию считаем по одному
+    # forward на полной сгенерированной последовательности (logits[t] предсказывает token[t+1]).
     gen_kwargs = {
         "max_new_tokens": int(max_new_tokens),
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
         "num_return_sequences": int(num_samples_per_prompt),
-        "return_dict_in_generate": True,
-        "output_scores": True,
     }
     if temperature is not None and temperature > 0:
         gen_kwargs["do_sample"] = True
@@ -137,34 +165,55 @@ def estimate_val_response_entropy(
                 inputs = {k: v.to(device) for k, v in inputs.items()}
 
                 generated = policy_model.generate(**inputs, **gen_kwargs)
-                scores = generated.scores
-                if not scores:
+                seq = getattr(generated, "sequences", generated)
+                in_len = int(inputs["input_ids"].shape[1])
+                gen_tokens = seq[:, in_len:]
+                t_resp = int(gen_tokens.shape[1])
+                if t_resp <= 0:
                     continue
-                # [steps, B*K, vocab] -> [B*K, steps]
-                h_steps = []
-                for step_scores in scores:
-                    step_logp = F.log_softmax(step_scores.float(), dim=-1)
-                    step_p = torch.exp(step_logp)
-                    h_t = -(step_p * step_logp).sum(dim=-1)
-                    h_steps.append(h_t)
-                h_by_seq = torch.stack(h_steps, dim=0).transpose(0, 1)
-
-                in_len = inputs["input_ids"].shape[1]
-                gen_tokens = generated.sequences[:, in_len:]
-                steps = int(h_by_seq.shape[1])
-                limit = int(min(entropy_tokens_limit, steps))
+                limit = int(min(entropy_tokens_limit, t_resp))
                 eos_id = tokenizer.eos_token_id
 
+                pad_id = tokenizer.pad_token_id
+                attn = (
+                    (seq != pad_id).long()
+                    if pad_id is not None
+                    else torch.ones_like(seq, dtype=torch.long)
+                )
+
                 per_seq_entropy: List[float] = []
-                for i in range(h_by_seq.shape[0]):
-                    valid = limit
-                    if eos_id is not None and gen_tokens.shape[1] > 0:
-                        eos_pos = (gen_tokens[i] == eos_id).nonzero(as_tuple=False)
-                        if eos_pos.numel() > 0:
-                            valid = min(valid, int(eos_pos[0, 0].item()) + 1)
-                    if valid <= 0:
-                        continue
-                    per_seq_entropy.append(float(h_by_seq[i, :valid].mean().item()))
+                fc = int(forward_chunk_size)
+                for c0 in range(0, seq.shape[0], fc):
+                    c1 = min(c0 + fc, seq.shape[0])
+                    sub = seq[c0:c1]
+                    sub_attn = attn[c0:c1]
+                    logits = policy_model(
+                        input_ids=sub,
+                        attention_mask=sub_attn,
+                    ).logits.float()
+                    # logits[b, pos] -> token[b, pos+1]; первый новый токен в pos=in_len
+                    slice_logits = logits[:, in_len - 1 : in_len - 1 + limit, :]
+                    if temperature is not None and float(temperature) > 0:
+                        slice_logits = slice_logits / float(temperature)
+                    step_logp = F.log_softmax(slice_logits, dim=-1)
+                    step_p = torch.exp(step_logp)
+                    h_tok = -(step_p * step_logp).sum(dim=-1)
+                    tail = gen_tokens[c0:c1, :limit]
+                    keep = _response_token_mask(tail, eos_id)
+                    for j in range(h_tok.shape[0]):
+                        sel = h_tok[j][keep[j]]
+                        if sel.numel() == 0:
+                            continue
+                        per_seq_entropy.append(float(sel.mean().item()))
+                    del logits, slice_logits, step_logp, step_p, h_tok, tail, keep
+
+                if (
+                    cuda_empty_cache_between_batches
+                    and isinstance(device, str)
+                    and device.startswith("cuda")
+                    and torch.cuda.is_available()
+                ):
+                    torch.cuda.empty_cache()
 
                 bsz = len(batch_prompts)
                 k = int(num_samples_per_prompt)

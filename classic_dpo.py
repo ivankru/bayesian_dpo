@@ -17,6 +17,12 @@ from transformers import TrainerCallback
 from trl import DPOConfig, DPOTrainer
 from tqdm import tqdm
 
+from config.base_config import (
+    CAPABILITY_EVAL_BATCH_SIZE,
+    CAPABILITY_EVAL_LIMIT,
+    CAPABILITY_EVAL_MAX_NEW_TOKENS,
+    CAPABILITY_EVAL_MAX_PROMPT_TOKENS,
+)
 from utils.config import BASE_MODEL_CHOICES, MAX_FULL_LEN, MAX_PROMPT_LEN
 from utils.seed import set_seed
 from utils.datasets import (
@@ -163,11 +169,12 @@ class DPOValidationMetricsCallback(TrainerCallback):
             desc="val pairwise acc",
         )
         epoch = int(state.epoch) if state.epoch is not None else 1
-        self.log_fn(f"=== Epoch {epoch} (validation) ===")
+        self.log_fn("")
+        self.log_fn(f"=== Validation, epoch {epoch} ===")
         self.log_fn(f"validation DPO loss   : {val_dpo:.4f}")
-        self.log_fn(f"validation val_logp_gap_mean : {val_kl:.4f}")
+        self.log_fn(f"validation logp_gap_mean : {val_kl:.4f}")
         self.log_fn(f"validation pair NLL   : {val_nll:.4f}")
-        self.log_fn(f"validation pair acc   : {val_acc:.4f}")
+        self.log_fn(f"validation pair acc   : {100 * val_acc:.2f}%")
         if self._cap_rows is not None and self._cap_ref_holder is not None:
             _classic_capability_retention(
                 self._cap_rows,
@@ -195,10 +202,10 @@ def main(
     lr: float = 2e-5,
     beta: float = 0.2,
     capability_eval_dir: Optional[str] = None,
-    capability_eval_limit: Optional[int] = None,
-    capability_eval_max_new_tokens: int = 256,
-    capability_eval_batch_size: int = 2,
-    capability_eval_max_prompt_tokens: int = 2048,
+    capability_eval_limit: Optional[int] = CAPABILITY_EVAL_LIMIT,
+    capability_eval_max_new_tokens: int = CAPABILITY_EVAL_MAX_NEW_TOKENS,
+    capability_eval_batch_size: int = CAPABILITY_EVAL_BATCH_SIZE,
+    capability_eval_max_prompt_tokens: int = CAPABILITY_EVAL_MAX_PROMPT_TOKENS,
 ):
     """
     resume_from: путь к чекпоинту для продолжения обучения.
@@ -220,8 +227,15 @@ def main(
         print(f"Загружаю модель из чекпоинта: {resume_from} (база {model_name})")
     else:
         print(f"Загружаю модель и токенайзер: {model_name} (LoRA)")
+    # TRL DPOTrainer ждёт отдельный PreTrainedModel под ref (shared-через-disable_adapter
+    # здесь не подойдёт), поэтому явно запрашиваем отдельную копию базы.
     tokenizer, policy_model, ref_model, device = load_models_and_tokenizer(
-        model_name, use_lora=True, lora_r=16, lora_alpha=32, resume_from=resume_from
+        model_name,
+        use_lora=True,
+        lora_r=16,
+        lora_alpha=32,
+        resume_from=resume_from,
+        share_ref_with_policy=False,
     )
 
     policy_model.config.use_cache = False
@@ -232,7 +246,9 @@ def main(
     log_path = os.path.join(output_dir, "train.log")
 
     def log_fn(msg: str) -> None:
-        print(msg, flush=True, file=sys.stderr)
+        # Лог-строки идут в stdout, чтобы не смешиваться с tqdm-прогрессами (stderr).
+        # Это даёт чистое `>run.log` с только осмысленными строками.
+        print(msg, flush=True, file=sys.stdout)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
 
@@ -311,11 +327,12 @@ def main(
         max_prompt_len=MAX_PROMPT_LEN, max_full_len=MAX_FULL_LEN,
         desc="init pairwise acc",
     )
-    log_fn("=== Initial (before training) ===")
+    log_fn("")
+    log_fn("=== Initial (before training), epoch 0 ===")
     log_fn(f"validation DPO loss   : {init_dpo:.4f}")
-    log_fn(f"validation val_logp_gap_mean : {init_kl:.4f}")
+    log_fn(f"validation logp_gap_mean : {init_kl:.4f}")
     log_fn(f"validation pair NLL   : {init_nll:.4f}")
-    log_fn(f"validation pair acc   : {init_acc:.4f}")
+    log_fn(f"validation pair acc   : {100 * init_acc:.2f}%")
     _classic_capability_retention(
         cap_rows,
         cap_ref_holder,
@@ -388,10 +405,6 @@ if __name__ == "__main__":
         default=None,
         help="Каталог eval_datasets: на каждой валидации лог capability retention.",
     )
-    parser.add_argument("--capability-eval-limit", type=int, default=None)
-    parser.add_argument("--capability-eval-max-new-tokens", type=int, default=256)
-    parser.add_argument("--capability-eval-batch-size", type=int, default=2)
-    parser.add_argument("--capability-eval-max-prompt-tokens", type=int, default=2048)
     args = parser.parse_args()
     main(
         resume_from=args.resume,
@@ -403,8 +416,4 @@ if __name__ == "__main__":
         lr=args.lr,
         beta=args.beta,
         capability_eval_dir=args.capability_eval_dir,
-        capability_eval_limit=args.capability_eval_limit,
-        capability_eval_max_new_tokens=args.capability_eval_max_new_tokens,
-        capability_eval_batch_size=args.capability_eval_batch_size,
-        capability_eval_max_prompt_tokens=args.capability_eval_max_prompt_tokens,
     )

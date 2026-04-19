@@ -2,9 +2,7 @@
 """
 Общие константы для DPO/soft-DPO и оценки: лимиты длины, базовые модели, датасеты steer.
 """
-# Лимиты длины (prompt и prompt+response)
-MAX_PROMPT_LEN = 768   # можно поднять до 1024, если хватает памяти
-MAX_FULL_LEN = 1536   #1024# prompt+response
+from config.base_config import MAX_FULL_LEN, MAX_PROMPT_LEN  # noqa: F401 — реэкспорт для импортов из utils.config
 
 # Базовые модели
 BASE_MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"

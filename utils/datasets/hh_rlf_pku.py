@@ -6,7 +6,7 @@ Hard DPO: {prompt, chosen, rejected}.
 Soft DPO: {prompt, resp1, resp2, p, p_bayes} (resp1=chosen, resp2=rejected;
 p = 1.0, p_bayes = (alpha + 1) / (2*alpha + 1)).
 
-Для Qwen2.5-Instruct в hard_dpo_steer по умолчанию use_chat_template=True: строка prompt
+Для Qwen2.5-Instruct по умолчанию (config.base_config.USE_CHAT_TEMPLATE) строка prompt
 идёт одним user-сообщением в apply_chat_template, затем считается log p только по токенам ответа.
 """
 

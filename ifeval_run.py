@@ -42,6 +42,7 @@ import torch
 from alpaca_eval_judge import (
     BASE_MODEL_CHOICES,
     generate_responses,
+    is_cuda_device,
     load_base_model,
     load_candidate_model,
 )
@@ -78,6 +79,9 @@ def ensure_ifeval_sources(cache_root: Optional[Path] = None) -> Tuple[Path, Path
     """
     Кладёт пакет instruction_following_eval и данные в cache_root.
     Возвращает (pkg_parent, path_to_input_jsonl), где pkg_parent нужно добавить в sys.path.
+
+    Маркер `.ifeval_sources_ok` хранит IFEVAL_REPO_PREFIX, чтобы при смене ревизии
+    (IFEVAL_GITHUB_REV) кэш автоматически инвалидировался и файлы перекачивались.
     """
     root = (cache_root or DEFAULT_CACHE_ROOT).resolve()
     pkg_parent = root / "pkg"
@@ -85,9 +89,19 @@ def ensure_ifeval_sources(cache_root: Optional[Path] = None) -> Tuple[Path, Path
     data_path = root / "data" / "input_data.jsonl"
 
     marker = root / ".ifeval_sources_ok"
-    if marker.is_file() and all((pkg_dir / name).is_file() for name in IFEVAL_PY_FILES):
-        if data_path.is_file():
-            return pkg_parent, data_path
+    cached_prefix = ""
+    if marker.is_file():
+        try:
+            cached_prefix = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            cached_prefix = ""
+    sources_complete = (
+        cached_prefix == IFEVAL_REPO_PREFIX
+        and all((pkg_dir / name).is_file() for name in IFEVAL_PY_FILES)
+        and data_path.is_file()
+    )
+    if sources_complete:
+        return pkg_parent, data_path
 
     pkg_dir.mkdir(parents=True, exist_ok=True)
     for name in IFEVAL_PY_FILES:
@@ -101,7 +115,11 @@ def ensure_ifeval_sources(cache_root: Optional[Path] = None) -> Tuple[Path, Path
     return pkg_parent, data_path
 
 
-def _ensure_nltk() -> None:
+def _ensure_nltk(cache_root: Optional[Path] = None) -> None:
+    """
+    Гарантирует наличие токенизаторов NLTK (punkt_tab или punkt).
+    Если HOME read-only, скачиваем в cache_root/nltk_data и регистрируем в nltk.data.path.
+    """
     import nltk
 
     for resource in ("punkt_tab", "punkt"):
@@ -110,9 +128,21 @@ def _ensure_nltk() -> None:
             return
         except LookupError:
             pass
+
+    download_dir: Optional[str] = None
+    if cache_root is not None:
+        nltk_dir = (cache_root / "nltk_data").resolve()
+        nltk_dir.mkdir(parents=True, exist_ok=True)
+        if str(nltk_dir) not in nltk.data.path:
+            nltk.data.path.insert(0, str(nltk_dir))
+        download_dir = str(nltk_dir)
+
     for resource in ("punkt_tab", "punkt"):
         try:
-            nltk.download(resource, quiet=True)
+            if download_dir is not None:
+                nltk.download(resource, quiet=True, download_dir=download_dir)
+            else:
+                nltk.download(resource, quiet=True)
         except Exception:
             continue
     for resource in ("punkt_tab", "punkt"):
@@ -127,7 +157,7 @@ def _ensure_nltk() -> None:
     )
 
 
-def import_evaluation_lib(pkg_parent: Path):
+def import_evaluation_lib(pkg_parent: Path, cache_root: Optional[Path] = None):
     """Импорт официального evaluation_lib после добавления пути."""
     parent = str(pkg_parent.resolve())
     if parent not in sys.path:
@@ -140,7 +170,7 @@ def import_evaluation_lib(pkg_parent: Path):
     except ImportError:
         pass
 
-    _ensure_nltk()
+    _ensure_nltk(cache_root=cache_root)
 
     try:
         from instruction_following_eval import evaluation_lib  # noqa: WPS433
@@ -154,9 +184,12 @@ def import_evaluation_lib(pkg_parent: Path):
 
 
 def load_ifeval_inputs_simple(
-    jsonl_path: str, pkg_parent: Path, max_evals: Optional[int] = None
+    jsonl_path: str,
+    pkg_parent: Path,
+    max_evals: Optional[int] = None,
+    cache_root: Optional[Path] = None,
 ):
-    evaluation_lib = import_evaluation_lib(pkg_parent)
+    evaluation_lib = import_evaluation_lib(pkg_parent, cache_root=cache_root)
     inputs = evaluation_lib.read_prompt_list(jsonl_path)
     if max_evals is not None:
         inputs = inputs[:max_evals]
@@ -286,6 +319,24 @@ def main() -> None:
         action="store_true",
         help="Не считать loose-метрики (верхняя оценка с ослабленными проверками).",
     )
+    parser.add_argument(
+        "--no-system-prompt",
+        action="store_true",
+        help=(
+            "Не добавлять system='You are a helpful assistant.' в chat-template. "
+            "Полезно для IFEval: с дефолтным system-сообщением модели иногда добавляют "
+            "преамбулу ('Sure! Here's...'), которая ломает позиционные констрейнты "
+            "(first_word, startswith, response_language и т.п.)."
+        ),
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Кастомный system-prompt (переопределяет дефолтный). Игнорируется при --no-system-prompt."
+        ),
+    )
     args = parser.parse_args()
 
     if args.base_only and args.checkpoint:
@@ -296,7 +347,7 @@ def main() -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     base_model_id = BASE_MODEL_CHOICES[args.base_model]
 
-    cache_root = Path(args.cache_dir).expanduser() if args.cache_dir else None
+    cache_root = Path(args.cache_dir).expanduser() if args.cache_dir else DEFAULT_CACHE_ROOT
     pkg_parent, default_data = ensure_ifeval_sources(cache_root)
     data_path = args.data or str(default_data)
     if not os.path.isfile(data_path):
@@ -317,6 +368,13 @@ def main() -> None:
 
     model_name_for_log = base_model_id if args.base_only else str(args.checkpoint)
 
+    if args.no_system_prompt:
+        system_prompt: Optional[str] = None
+    elif args.system_prompt is not None:
+        system_prompt = args.system_prompt
+    else:
+        system_prompt = "You are a helpful assistant."
+
     log("=== IFEval (Google Instruction Following Eval, rule-based) ===")
     log(f"Source: {IFEVAL_REPO_PREFIX}")
     log(f"Model: {model_name_for_log}" + (" (base, no LoRA)" if args.base_only else ""))
@@ -324,8 +382,14 @@ def main() -> None:
     log(f"Data: {data_path}")
     log(f"Device: {device}")
     log(f"max_new_tokens={args.max_new_tokens}, batch_size={args.batch_size}, do_sample={args.do_sample}")
+    log(
+        "system_prompt: "
+        + ("<none>" if system_prompt is None else repr(system_prompt))
+    )
 
-    evaluation_lib, inputs = load_ifeval_inputs_simple(data_path, pkg_parent, args.max_evals)
+    evaluation_lib, inputs = load_ifeval_inputs_simple(
+        data_path, pkg_parent, args.max_evals, cache_root=cache_root
+    )
     n = len(inputs)
     log(f"Examples: {n}")
 
@@ -348,10 +412,11 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         batch_size=args.batch_size,
         do_sample=args.do_sample,
+        system_prompt=system_prompt,
     )
 
     del model
-    if device == "cuda":
+    if is_cuda_device(device):
         torch.cuda.empty_cache()
 
     prompt_to_response = {inp.prompt: responses[i] for i, inp in enumerate(inputs)}

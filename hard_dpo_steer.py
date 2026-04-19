@@ -7,6 +7,13 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
+from config.base_config import (
+    CAPABILITY_EVAL_BATCH_SIZE,
+    CAPABILITY_EVAL_LIMIT,
+    CAPABILITY_EVAL_MAX_NEW_TOKENS,
+    CAPABILITY_EVAL_MAX_PROMPT_TOKENS,
+    USE_CHAT_TEMPLATE,
+)
 from utils.config import BASE_MODEL_CHOICES, DPO_STEER_HARD_DATASET_CHOICES as DATASET_CHOICES
 from utils.seed import set_seed
 from utils.datasets import (
@@ -34,14 +41,15 @@ def main(
     beta: float = 0.2,
     epochs: int = 8,
     lambda_min: float = 1.0,
-    use_chat_template: Optional[bool] = None,
+    use_chat_template: bool = USE_CHAT_TEMPLATE,
     capability_eval_dir: Optional[str] = None,
-    capability_eval_limit: Optional[int] = None,
-    capability_eval_max_new_tokens: int = 256,
-    capability_eval_batch_size: int = 2,
-    capability_eval_max_prompt_tokens: int = 2048,
+    capability_eval_limit: Optional[int] = CAPABILITY_EVAL_LIMIT,
+    capability_eval_max_new_tokens: int = CAPABILITY_EVAL_MAX_NEW_TOKENS,
+    capability_eval_batch_size: int = CAPABILITY_EVAL_BATCH_SIZE,
+    capability_eval_max_prompt_tokens: int = CAPABILITY_EVAL_MAX_PROMPT_TOKENS,
     capability_ref_cache_path: Optional[str] = None,
     val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
+    resume_start_epoch_1based: int = 1,
 ):
     """
     resume_from: путь к чекпоинту (например "checkpoints/hard_dpo_steer/best").
@@ -52,8 +60,9 @@ def main(
     base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507.
     batch_size: размер батча для train и validation.
     lambda_min: для режима hard не используется (оставлено для единообразия CLI с soft_dpo_steer).
-    use_chat_template: если None — для hh_rlhf True (PKU HH), иначе False; иначе явное значение для get_logps.
+    use_chat_template: log p через apply_chat_template (дефолт в config.base_config).
     capability_eval_dir: если задан — на каждой валидации eval_datasets (gold), см. train_dpo.
+    resume_start_epoch_1based: см. utils.training.train_dpo (--epochs = полный план, --start-epoch).
     """
     if dataset not in DATASET_CHOICES:
         raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
@@ -77,11 +86,10 @@ def main(
         model_name, use_lora=True, lora_r=16, lora_alpha=32, resume_from=resume_from
     )
 
-    if use_chat_template is None:
-        use_chat_template = dataset == "hh_rlhf"
-
     def log_fn(msg: str) -> None:
-        print(msg, flush=True, file=sys.stderr)
+        # Лог-строки идут в stdout, чтобы не смешиваться с tqdm-прогрессами (stderr).
+        # Это даёт чистое `>run.log` с только осмысленными строками.
+        print(msg, flush=True, file=sys.stdout)
 
     print("Начинаю обучение DPO (hard)...")
     train_dpo(
@@ -110,6 +118,8 @@ def main(
         capability_eval_max_prompt_tokens=capability_eval_max_prompt_tokens,
         capability_ref_cache_path=capability_ref_cache_path,
         val_kl_mc_max_prompts=val_kl_mc_max_prompts,
+        resume_start_epoch_1based=resume_start_epoch_1based,
+        resume_checkpoint_dir=resume_from,
     )
 
 
@@ -152,53 +162,36 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
     parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
-    parser.add_argument("--epochs", "-e", type=int, default=8, help="Количество эпох обучения (по умолчанию: 8).")
+    parser.add_argument(
+        "--epochs",
+        "-e",
+        type=int,
+        default=8,
+        help="Всего эпох в плане (LR по шкале 1..epochs). При --start-epoch>1 обучаются эпохи start..epochs.",
+    )
+    parser.add_argument(
+        "--start-epoch",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Первая эпоха запуска (1-based), <= --epochs; --resume после эпохи N-1. "
+            "Эпох в этом запуске: epochs - start + 1. "
+            "При --resume и N>1 в начало train.log в --output-dir переносится история "
+            "старого train.log (рядом с чекпоинтом) до эпохи N, если граница найдена в логе."
+        ),
+    )
     parser.add_argument(
         "--lambda-min",
         type=_lambda_min_type,
         default=1.0,
         help="Для hard не влияет; единый флаг с soft_dpo_steer [0, 1] (по умолчанию: 1.0).",
     )
-    chat_group = parser.add_mutually_exclusive_group()
-    chat_group.add_argument(
-        "--use-chat-template",
-        action="store_true",
-        help="Считать log p через apply_chat_template (Qwen-Instruct). По умолчанию включено только для hh_rlhf.",
-    )
-    chat_group.add_argument(
-        "--no-use-chat-template",
-        action="store_true",
-        help="Считать log p как plain prompt\\nresponse (отключить chat template, в т.ч. для hh_rlhf).",
-    )
     parser.add_argument(
         "--capability-eval-dir",
         type=str,
         default=None,
         help="Каталог eval_datasets (knowledge/*.jsonl, reasoning/*.jsonl): на каждой валидации лог retention.",
-    )
-    parser.add_argument(
-        "--capability-eval-limit",
-        type=int,
-        default=None,
-        help="Максимум примеров для retention (первые N).",
-    )
-    parser.add_argument(
-        "--capability-eval-max-new-tokens",
-        type=int,
-        default=256,
-        help="Генерация для retention (по умолчанию 256).",
-    )
-    parser.add_argument(
-        "--capability-eval-batch-size",
-        type=int,
-        default=2,
-        help="Батч генерации для retention (по умолчанию 2).",
-    )
-    parser.add_argument(
-        "--capability-eval-max-prompt-tokens",
-        type=int,
-        default=2048,
-        help="Truncation промпта для retention.",
     )
     parser.add_argument(
         "--capability-ref-cache-path",
@@ -216,11 +209,6 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
-    use_chat_template: Optional[bool] = None
-    if args.use_chat_template:
-        use_chat_template = True
-    elif args.no_use_chat_template:
-        use_chat_template = False
     main(
         resume_from=args.resume,
         seed=args.seed,
@@ -232,12 +220,8 @@ if __name__ == "__main__":
         beta=args.beta,
         epochs=args.epochs,
         lambda_min=args.lambda_min,
-        use_chat_template=use_chat_template,
         capability_eval_dir=args.capability_eval_dir,
-        capability_eval_limit=args.capability_eval_limit,
-        capability_eval_max_new_tokens=args.capability_eval_max_new_tokens,
-        capability_eval_batch_size=args.capability_eval_batch_size,
-        capability_eval_max_prompt_tokens=args.capability_eval_max_prompt_tokens,
         capability_ref_cache_path=args.capability_ref_cache_path,
         val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,
+        resume_start_epoch_1based=args.start_epoch,
     )

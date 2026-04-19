@@ -24,7 +24,7 @@ def ultrafeedback_message_to_response(messages: List[Dict[str, str]]) -> str:
     return "\n".join(parts).strip() if parts else ""
 
 
-def precompute_p_pred_cached(
+def _precompute_p_pred_column(
     train_ds: Dataset,
     tokenizer,
     policy_model,
@@ -34,11 +34,11 @@ def precompute_p_pred_cached(
     use_chat_template: bool,
     batch_size: int,
     collate_fn: Callable[..., Any],
+    column_name: str,
 ) -> Dataset:
     """
-    Один проход по train_ds (порядок строк датасета): считаете
-    p_pred = sigmoid(beta * ((logp1-logp2) - (logp1_ref-logp2_ref))) как в soft_dpo_loss,
-    записывает столбец p_pred_cached. Политика и ref — в torch.no_grad().
+    Один проход по train_ds: p = sigmoid(beta * diff), diff как в soft_dpo_loss;
+    записывает столбец column_name. Политика и ref — в torch.no_grad().
     """
     loader = DataLoader(
         train_ds,
@@ -74,9 +74,68 @@ def precompute_p_pred_cached(
             p_preds.extend(p_pred_batch.detach().cpu().float().tolist())
 
     assert len(p_preds) == len(train_ds), (
-        f"p_pred_cached length {len(p_preds)} != len(train_ds) {len(train_ds)}"
+        f"{column_name} length {len(p_preds)} != len(train_ds) {len(train_ds)}"
     )
 
-    if "p_pred_cached" in train_ds.column_names:
-        train_ds = train_ds.remove_columns(["p_pred_cached"])
-    return train_ds.add_column("p_pred_cached", p_preds)
+    if column_name in train_ds.column_names:
+        train_ds = train_ds.remove_columns([column_name])
+    return train_ds.add_column(column_name, p_preds)
+
+
+def precompute_p_pred_cached(
+    train_ds: Dataset,
+    tokenizer,
+    policy_model,
+    ref_model,
+    device: str,
+    beta: float,
+    use_chat_template: bool,
+    batch_size: int,
+    collate_fn: Callable[..., Any],
+) -> Dataset:
+    """
+    Один проход по train_ds (порядок строк датасета): считаете
+    p_pred = sigmoid(beta * ((logp1-logp2) - (logp1_ref-logp2_ref))) как в soft_dpo_loss,
+    записывает столбец p_pred_cached. Политика и ref — в torch.no_grad().
+    """
+    return _precompute_p_pred_column(
+        train_ds,
+        tokenizer,
+        policy_model,
+        ref_model,
+        device,
+        beta,
+        use_chat_template,
+        batch_size,
+        collate_fn,
+        "p_pred_cached",
+    )
+
+
+def precompute_p_pred_teacher(
+    train_ds: Dataset,
+    tokenizer,
+    policy_model,
+    ref_model,
+    device: str,
+    beta: float,
+    use_chat_template: bool,
+    batch_size: int,
+    collate_fn: Callable[..., Any],
+) -> Dataset:
+    """
+    Заморозка «учителя» после warmup-эпох: те же σ(beta*diff), что и для p_pred_cached,
+    но в отдельный столбец p_pred_teacher (не перезаписывается в фазе смешивания).
+    """
+    return _precompute_p_pred_column(
+        train_ds,
+        tokenizer,
+        policy_model,
+        ref_model,
+        device,
+        beta,
+        use_chat_template,
+        batch_size,
+        collate_fn,
+        "p_pred_teacher",
+    )

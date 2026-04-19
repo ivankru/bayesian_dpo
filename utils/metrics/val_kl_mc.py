@@ -7,7 +7,7 @@ Monte Carlo оценка forward KL(π_θ || π_ref) по сэмплам y ~ π_
 несмещённую (по y) оценку ∫ π_θ(y|x) log(π_θ(y|x)/π_ref(y|x)) dy для каждого x, усреднённую по
 выбранным промптам — т.е. sample-based MC по политике, а не по фиксированным chosen/rejected из данных.
 """
-from typing import List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 from tqdm import tqdm
@@ -50,6 +50,24 @@ def get_logps_generated(
     )
 
 
+def _count_response_tokens(
+    tokenizer,
+    responses: List[str],
+) -> List[int]:
+    """Число токенов ответа (без обрезки и паддинга) для per-token нормализации KL-MC.
+
+    Использует ту же токенизацию без специальных токенов, что и get_logps в chat-template
+    ветке; даёт верхнюю оценку числа токенов, по которым берётся log p. Для согласованности с
+    get_logps при чрезмерно длинных ответах (> max_full_len - prefix) можно было бы учесть
+    обрезку, но для KL-MC (cap ~8192) обрезка крайне редка при max_new_tokens порядка сотен.
+    """
+    out: List[int] = []
+    for r in responses:
+        ids = tokenizer(r, add_special_tokens=False)["input_ids"]
+        out.append(max(1, len(ids)))
+    return out
+
+
 def estimate_val_kl_mc(
     policy_model,
     ref_model,
@@ -65,9 +83,18 @@ def estimate_val_kl_mc(
     prompt_batch_size: int = 6,
     logp_score_batch_size: int = 16,
     show_progress: bool = True,
-) -> float:
+) -> Dict[str, float]:
     """
-    MC-оценка: (1/N) Σ_i [ log π_θ(y_i|x_i) - log π_ref(y_i|x_i) ], где y_i ~ π_θ(·|x_i), N = P * K.
+    MC-оценка forward KL(π_θ || π_ref). Возвращает dict:
+
+    - ``per_seq``: (1/N) Σ_i [ log π_θ(y_i|x_i) - log π_ref(y_i|x_i) ], где y_i ~ π_θ(·|x_i), N = P*K.
+      «Среднее лог-отношение на последовательность». Зависит от средней длины генерации —
+      плохо для кросс-прогонных сравнений.
+    - ``per_token``: Σ_i [ log π_θ(y_i|x_i) - log π_ref(y_i|x_i) ] / Σ_i n_tokens(y_i).
+      «KL на токен». Инвариантна к длине ответа, что делает её предпочтительной для
+      сравнения прогонов с разной длиной генерации.
+    - ``total_seqs``: фактическое число просчитанных последовательностей.
+    - ``total_tokens``: суммарное число ответных токенов (∑ n_tokens).
 
     Память: промпты батчами по ``prompt_batch_size``; лог-вероятности и лог-отношения накоплениями по
     микробатчам ``logp_score_batch_size`` без хранения всех строк одновременно.
@@ -103,6 +130,7 @@ def estimate_val_kl_mc(
 
     total_log_ratio = 0.0
     total_count = 0
+    total_resp_tokens = 0
 
     saved_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
@@ -185,8 +213,16 @@ def estimate_val_kl_mc(
                     )
                     total_log_ratio += (log_pi - log_ref).sum().item()
                     total_count += len(mp)
+                    total_resp_tokens += sum(_count_response_tokens(tokenizer, mr))
 
     finally:
         tokenizer.padding_side = saved_padding_side
 
-    return total_log_ratio / max(1, total_count)
+    n_seqs = max(1, total_count)
+    n_tok = max(1, total_resp_tokens)
+    return {
+        "per_seq": total_log_ratio / n_seqs,
+        "per_token": total_log_ratio / n_tok,
+        "total_seqs": float(total_count),
+        "total_tokens": float(total_resp_tokens),
+    }
