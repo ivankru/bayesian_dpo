@@ -566,12 +566,12 @@ def format_capability_retention_log_lines(
         if key != "overall" and int(s.get("n", 0)) == 0:
             continue
         lines.append(
-            f"  [{key}] n={int(s['n'])} acc_ref={float(s['accuracy_base']):.4f} "
-            f"acc_policy={float(s['accuracy_policy']):.4f} "
+            f"  [{key}] n={int(s['n'])} acc_ref={100.0 * float(s['accuracy_base']):.2f}% "
+            f"acc_policy={100.0 * float(s['accuracy_policy']):.2f}% "
             f"regressions={int(s['regressions'])} improvements={int(s['improvements'])} "
-            f"raw_match_rate={float(s['raw_output_match_rate']):.4f} "
-            f"parse_fail_ref={float(s['parse_fail_rate_base']):.4f} "
-            f"parse_fail_pol={float(s['parse_fail_rate_policy']):.4f}"
+            f"raw_match_rate={100.0 * float(s['raw_output_match_rate']):.2f}% "
+            f"parse_fail_ref={100.0 * float(s['parse_fail_rate_base']):.2f}% "
+            f"parse_fail_pol={100.0 * float(s['parse_fail_rate_policy']):.2f}%"
         )
     return lines
 

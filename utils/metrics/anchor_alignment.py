@@ -62,7 +62,7 @@ def format_anchor_alignment_log(m: Dict[str, float]) -> str:
     """Одна строка для train.log (после основной строки loss)."""
     parts = [
         f"target_shift_mean={m['target_shift_mean']:.4f}",
-        f"target_shift_frac_gt_0.1={m['target_shift_frac_gt_0.1']:.4f}",
+        f"target_shift_frac_gt_0.1={100.0 * m['target_shift_frac_gt_0.1']:.2f}%",
     ]
     if not math.isnan(m.get("gap_abs_mean", float("nan"))):
         parts.extend(
@@ -71,8 +71,8 @@ def format_anchor_alignment_log(m: Dict[str, float]) -> str:
                 f"gap_abs_median={m['gap_abs_median']:.4f}",
                 f"gap_abs_p90={m['gap_abs_p90']:.4f}",
                 f"gap_abs_mean_top10={m['gap_abs_mean_top10']:.4f}",
-                f"gap_abs_frac_gt_0.5={m['gap_abs_frac_gt_0.5']:.4f}",
-                f"gap_abs_frac_gt_0.3={m['gap_abs_frac_gt_0.3']:.4f}",
+                f"gap_abs_frac_gt_0.5={100.0 * m['gap_abs_frac_gt_0.5']:.2f}%",
+                f"gap_abs_frac_gt_0.3={100.0 * m['gap_abs_frac_gt_0.3']:.2f}%",
             ]
         )
     else:

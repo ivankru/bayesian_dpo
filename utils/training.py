@@ -37,6 +37,7 @@ from config.base_config import (
     VAL_ENTROPY_MAX_PROMPTS,
     VAL_ENTROPY_NUM_SAMPLES,
     VAL_ENTROPY_PROMPT_BATCH_SIZE,
+    VAL_KL_MC_NUM_SAMPLES,
 )
 from utils.datasets import precompute_p_pred_cached, precompute_p_pred_teacher
 from utils.loss import hard_dpo_loss, soft_dpo_loss
@@ -631,7 +632,7 @@ def train_dpo(
     mlflow_run_name: Optional[str] = None,
     mlflow_tracking_uri: Optional[str] = None,
     val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
-    val_kl_mc_num_samples: int = 4,
+    val_kl_mc_num_samples: int = VAL_KL_MC_NUM_SAMPLES,
     val_kl_mc_max_new_tokens: int = 128,
     val_kl_mc_prompt_batch_size: int = 6,
     val_entropy_max_prompts: int = VAL_ENTROPY_MAX_PROMPTS,
@@ -714,7 +715,7 @@ def train_dpo(
         до цикла эпох вызывается precompute_p_pred_teacher по загруженным весам — как фиксация учителя
         в конце эпохи k в непрерывном прогоне (при отсутствии столбца p_pred_teacher в train_ds).
     Для soft/bayes и датасетов openbmb, ultrafeedback_binarized, ultrafeedback_soft, hh_rlhf при epochs>=2:
-        после первой половины батчей эпохи — валидация с меткой «1.5», «2.5», …; затем lambda_label
+        после первой половины батчей эпохи — валидация с меткой «0.5», «1.5», …; затем lambda_label
         по расписанию для позиции k.5 (с учётом lambda_full_epochs) и при необходимости пересчёт p_pred_cached
         для второй половины эпохи; в якорном режиме (p_pred_teacher) пересчёт кэша не делается.
     """
@@ -989,7 +990,7 @@ def train_dpo(
             mlflow_step: Optional[int] = None,
             training_seconds: Optional[float] = None,
         ) -> float:
-            """epoch_display: '1', '1.5', ... для логов и имён артефактов. Возвращает val NLL."""
+            """epoch_display: '1', '0.5', '1.5', ... для логов и имён артефактов. Возвращает val NLL."""
             tag = _epoch_tag_for_files(epoch_display)
             step_m = global_step if mlflow_step is None else mlflow_step
             t_validation_total_start = perf_counter()
@@ -1044,6 +1045,7 @@ def train_dpo(
 
             log_msg("")
             log_msg(f"=== Validation, epoch {epoch_display} ===")
+            log_msg("")
             log_msg(f"validation DPO loss   : {val_dpo:.4f}")
             log_msg(f"validation logp_gap_mean : {val_kl:.4f}")
             log_msg(f"validation pair NLL   : {val_nll:.4f}")
@@ -1242,6 +1244,7 @@ def train_dpo(
             log_msg("timings: " + ", ".join(timing_parts))
             # Пик на обучении логируется сразу после train_one_epoch_dpo (отдельная строка).
             log_msg(f"gpu_mem_peak: validation={_fmt_mem_gb(validation_peak_mem_gb)}")
+            log_msg("")
             return val_nll
 
         use_mid_epoch_val = (
@@ -1375,6 +1378,7 @@ def train_dpo(
                 use_chat_template=use_chat_template,
                 desc="init pairwise acc",
             )
+            log_msg("")
             log_msg(f"validation DPO loss   : {init_dpo:.4f}")
             log_msg(f"validation logp_gap_mean : {init_kl:.4f}")
             log_msg(f"validation pair NLL   : {init_nll:.4f}")
@@ -1602,7 +1606,7 @@ def train_dpo(
 
                     def mid_hook(gs: int) -> None:
                         nonlocal train_ds, epoch_loss_kw
-                        mid_epoch_display = f"{g0 + 1.5:.1f}"
+                        mid_epoch_display = f"{g0 + 0.5:.1f}"
                         # Mid-epoch валидация — диагностика динамики, не критерий
                         # save-best: падение здесь (OOM на KL_MC, сеть отвалилась
                         # при cap-retention и т.п.) не должно ронять оставшиеся
