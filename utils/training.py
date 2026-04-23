@@ -38,6 +38,7 @@ from config.base_config import (
     VAL_ENTROPY_NUM_SAMPLES,
     VAL_ENTROPY_PROMPT_BATCH_SIZE,
     VAL_KL_MC_NUM_SAMPLES,
+    VAL_KL_MC_PROMPT_BATCH_SIZE,
 )
 from utils.datasets import precompute_p_pred_cached, precompute_p_pred_teacher
 from utils.loss import hard_dpo_loss, soft_dpo_loss
@@ -634,7 +635,7 @@ def train_dpo(
     val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
     val_kl_mc_num_samples: int = VAL_KL_MC_NUM_SAMPLES,
     val_kl_mc_max_new_tokens: int = 128,
-    val_kl_mc_prompt_batch_size: int = 6,
+    val_kl_mc_prompt_batch_size: int = VAL_KL_MC_PROMPT_BATCH_SIZE,
     val_entropy_max_prompts: int = VAL_ENTROPY_MAX_PROMPTS,
     val_entropy_num_samples: int = VAL_ENTROPY_NUM_SAMPLES,
     val_entropy_max_new_tokens: int = VAL_ENTROPY_MAX_NEW_TOKENS,
