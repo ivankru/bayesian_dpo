@@ -254,9 +254,9 @@ def main(
 
     training_args = DPOConfig(
         output_dir=output_dir,
-        num_train_epochs=8,
+        num_train_epochs=3,
         per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=3,
+        gradient_accumulation_steps=1,
         per_device_eval_batch_size=2,
         learning_rate=lr,
         logging_steps=10,

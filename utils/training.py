@@ -515,6 +515,7 @@ def train_one_epoch_dpo(
     policy_model.train()
     running_loss = 0.0
     running_kl = 0.0
+    running_grad_abs_mean = 0.0
     log_interval = int(LOG_INTERVAL)
     # Строка lr и агрегированные align-метрики с той же периодичностью (накопление за весь интервал).
     lr_align_log_interval = int(LR_ALIGN_LOG_INTERVAL)
@@ -534,7 +535,7 @@ def train_one_epoch_dpo(
         align_ts_parts.clear()
 
     def process_batch(batch) -> None:
-        nonlocal global_step, running_loss, running_kl
+        nonlocal global_step, running_loss, running_kl, running_grad_abs_mean
         optimizer.zero_grad(set_to_none=True)
         out = loss_fn(batch, tokenizer, policy_model, ref_model, device, **loss_kw)
         if len(out) == 3:
@@ -549,12 +550,22 @@ def train_one_epoch_dpo(
         else:
             loss, kl_batch = out
         loss.backward()
+        grad_abs_sum = 0.0
+        grad_numel = 0
+        for p in policy_model.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            grad_abs_sum += g.abs().sum().item()
+            grad_numel += g.numel()
+        grad_abs_mean = grad_abs_sum / max(1, grad_numel)
         torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
 
         running_loss += loss.item()
         running_kl += kl_batch
+        running_grad_abs_mean += grad_abs_mean
         global_step += 1
 
         if global_step % lr_align_log_interval == 0:
@@ -567,14 +578,19 @@ def train_one_epoch_dpo(
             n = log_interval
             log(
                 f"[epoch {epoch_1based} step {global_step}] "
-                f"train_loss={running_loss / n:.4f} "
-                f"train_logp_gap_mean={running_kl / n:.4f}"
+                f"loss={running_loss / n:.4f} "
+                f"logp_gap_mean={running_kl / n:.4f} "
+                f"grad_abs_mean={running_grad_abs_mean / n:.6e}"
             )
             if use_mlflow:
-                mlflow.log_metric("train_loss", running_loss / n, step=global_step)
-                mlflow.log_metric("train_logp_gap_mean", running_kl / n, step=global_step)
+                mlflow.log_metric("loss", running_loss / n, step=global_step)
+                mlflow.log_metric("logp_gap_mean", running_kl / n, step=global_step)
+                mlflow.log_metric(
+                    "grad_abs_mean", running_grad_abs_mean / n, step=global_step
+                )
             running_loss = 0.0
             running_kl = 0.0
+            running_grad_abs_mean = 0.0
 
     split_mid = mid_epoch_hook is not None and len(train_loader_box) == 2
 
