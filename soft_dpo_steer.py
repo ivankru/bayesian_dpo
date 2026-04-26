@@ -71,6 +71,7 @@ class SoftDPOConfig:
     lambda_schedule: str = "linear"
     lambda_full_epochs: int = 0
     p_pred_target_temperature: float = P_PRED_TARGET_TEMPERATURE
+    soft_loss_type: str = "approximation"
     use_chat_template: bool = USE_CHAT_TEMPLATE
 
     # --- capability retention (дефолты в config/base_config.py) ---
@@ -188,6 +189,7 @@ def main(cfg: SoftDPOConfig) -> None:
         lambda_schedule=cfg.lambda_schedule,
         lambda_full_epochs=cfg.lambda_full_epochs,
         p_pred_target_temperature=cfg.p_pred_target_temperature,
+        soft_loss_type=cfg.soft_loss_type,
         seed=cfg.seed,
         label_noise_prob=cfg.label_noise_prob,
         use_chat_template=cfg.use_chat_template,
@@ -318,6 +320,17 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         ),
     )
     parser.add_argument(
+        "--soft-loss-type",
+        type=str,
+        choices=["classic", "approximation", "centered_softplus"],
+        default="approximation",
+        help=(
+            "Вариант soft train-loss: classic=soft_dpo_classic_loss; "
+            "approximation=soft_dpo_approximation_loss (scaled old_loss/beta, малобета-аппроксимация); "
+            "centered_softplus=soft_dpo_centered_softplus_loss."
+        ),
+    )
+    parser.add_argument(
         "--capability-eval-dir",
         type=str,
         default=None,
@@ -355,6 +368,7 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         lambda_min=args.lambda_min,
         lambda_schedule=args.lambda_schedule,
         lambda_full_epochs=args.lambda_full_epochs,
+        soft_loss_type=args.soft_loss_type,
         capability_eval_dir=args.capability_eval_dir,
         capability_ref_cache_path=args.capability_ref_cache_path,
         val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,

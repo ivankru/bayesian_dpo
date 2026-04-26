@@ -41,7 +41,7 @@ from config.base_config import (
     VAL_KL_MC_PROMPT_BATCH_SIZE,
 )
 from utils.datasets import precompute_p_pred_cached, precompute_p_pred_teacher
-from utils.loss import hard_dpo_loss, soft_dpo_loss
+from utils.loss import get_loss, hard_dpo_loss
 from utils.metrics import (
     EvalRow,
     aggregate_anchor_alignment_window,
@@ -302,6 +302,7 @@ def _build_loss_spec(
     beta: float,
     use_chat_template: bool,
     p_pred_target_temperature: float,
+    soft_loss_type: str,
 ) -> Tuple[Callable, Callable, Dict[str, Any], str]:
     """По режиму возвращает (train_collate, train_loss_fn, loss_kwargs, mode_label).
 
@@ -315,9 +316,22 @@ def _build_loss_spec(
             "Hard DPO",
         )
     use_bayes = mode == "bayes"
+    soft_loss_by_type = {
+        "classic": "soft_dpo_classic_loss",
+        "approximation": "soft_dpo_approximation_loss",
+        "centered_softplus": "soft_dpo_centered_softplus_loss",
+    }
+    try:
+        soft_loss_name = soft_loss_by_type[soft_loss_type]
+    except KeyError as exc:
+        available = ", ".join(sorted(soft_loss_by_type))
+        raise ValueError(
+            f"Unknown soft_loss_type {soft_loss_type!r}. Available: {available}"
+        ) from exc
+    soft_loss_fn = get_loss(soft_loss_name)
     return (
         collate_fn_soft,
-        soft_dpo_loss,
+        soft_loss_fn,
         {
             "beta": beta,
             "use_bayes": use_bayes,
@@ -640,6 +654,7 @@ def train_dpo(
     lambda_schedule: str = "linear",
     lambda_full_epochs: int = 0,
     p_pred_target_temperature: float = P_PRED_TARGET_TEMPERATURE,
+    soft_loss_type: str = "classic",
     seed: int = 42,
     label_noise_prob: Optional[float] = None,
     use_chat_template: bool = USE_CHAT_TEMPLATE,
@@ -674,8 +689,8 @@ def train_dpo(
     Универсальный цикл DPO: hard, soft или bayes.
 
     mode: "hard" — train и val в формате chosen/rejected, loss = hard_dpo_loss.
-          "soft" — train в формате resp1, resp2, p, p_bayes; val в формате chosen/rejected; train loss = soft_dpo_loss(use_bayes=False).
-          "bayes" — как soft, но train loss = soft_dpo_loss(use_bayes=True).
+          "soft" — train в формате resp1, resp2, p, p_bayes; val в формате chosen/rejected; train loss = soft_dpo_classic_loss(use_bayes=False).
+          "bayes" — как soft, но train loss = soft_dpo_classic_loss(use_bayes=True).
 
     epochs: общее число эпох в плане (для λ и linear LR по шкале 1..epochs). Цикл обучения —
         эпохи resume_start_epoch_1based, …, epochs (включительно). Старт с начала: resume_start_epoch_1based=1.
@@ -691,7 +706,11 @@ def train_dpo(
         после загрузки — без лишней эпохи на λ=1. Пока в train_ds есть p_pred_teacher, в p_pred при λ<1
         всегда w=0.5: 0.5*p_pred_teacher + 0.5*σ((beta*diff)/T).
         0 — без warmup-анкора: расписание λ от первой эпохи, кэш p_pred_cached пересчитывается каждый шаг.
-    p_pred_target_temperature: T>0 для σ((beta*diff)/T) в якорном режиме (см. utils.loss.soft_dpo_loss); при lambda_full_epochs=0 не используется.
+    p_pred_target_temperature: T>0 для σ((beta*diff)/T) в якорном режиме (см. utils.losses.classic.soft_dpo_classic_loss); при lambda_full_epochs=0 не используется.
+    soft_loss_type: выбор train-loss для mode in {"soft","bayes"}:
+        "classic" -> soft_dpo_classic_loss,
+        "approximation" -> soft_dpo_approximation_loss,
+        "centered_softplus" -> soft_dpo_centered_softplus_loss.
     seed: фиксирует shuffle train DataLoader (torch.Generator + num_workers=0).
     label_noise_prob: вероятность шума меток при сборке soft train (--label-noise-prob); для hard не задаётся (в логе N/A).
     use_chat_template: если True, get_logps использует tokenizer.apply_chat_template (Qwen-Instruct); иначе plain prompt\\nresponse (дефолт: config.base_config.USE_CHAT_TEMPLATE).
@@ -800,6 +819,10 @@ def train_dpo(
         with open(log_path, "w", encoding="utf-8") as wf:
             wf.writelines(prior_train_log_lines)
             wf.write(sep)
+    else:
+        # Каждый новый запуск без resume-истории начинает train.log с чистого листа.
+        with open(log_path, "w", encoding="utf-8"):
+            pass
 
     mlflow_param_dict: Dict[str, Any] = {
         "mode": mode,
@@ -811,6 +834,7 @@ def train_dpo(
         "lambda_schedule": lambda_schedule,
         "lambda_full_epochs": lambda_full_epochs,
         "p_pred_target_temperature": p_pred_target_temperature,
+        "soft_loss_type": soft_loss_type,
         "seed": seed,
         "dataset_name": dataset_name,
         "model_name": model_name,
@@ -847,12 +871,15 @@ def train_dpo(
         mlflow_param_dict,
         log_path,
     ):
+        run_started_at = datetime.now()
+        run_started_perf = perf_counter()
         use_bayes = mode == "bayes"
         train_collate, train_loss_fn, loss_kwargs, mode_label = _build_loss_spec(
             mode=mode,
             beta=beta,
             use_chat_template=use_chat_template,
             p_pred_target_temperature=p_pred_target_temperature,
+            soft_loss_type=soft_loss_type,
         )
 
         g = torch.Generator()
@@ -1327,7 +1354,7 @@ def train_dpo(
             mlflow.log_param("steps_delta_actual_minus_planned", steps_delta)
 
         log_msg(f"=== {mode_label} ===")
-        log_msg(f"Run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log_msg(f"Run started at: {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
         log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
         _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
         log_msg(
@@ -1770,3 +1797,10 @@ def train_dpo(
             log_msg(
                 f"[epoch {g0 + 1}/{epochs}] checkpoint (full epoch only): {epoch_ckpt_dir}"
             )
+
+        run_finished_at = datetime.now()
+        run_duration_sec = perf_counter() - run_started_perf
+        log_msg("")
+        log_msg(f"Run finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        log_msg("Run status: SUCCESS")
+        log_msg(f"Run duration: {run_duration_sec:.1f}s")
