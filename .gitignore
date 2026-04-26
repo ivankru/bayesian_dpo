@@ -21,6 +21,8 @@
 !utils/metrics/*.py
 !utils/datasets/
 !utils/datasets/*.py
+!utils/losses/
+!utils/losses/*.py
 !utils/seed.py
 
 # Исключение: сам .gitignore должен быть в репозитории
