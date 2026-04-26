@@ -32,7 +32,9 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Dict, Optional, Tuple
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -365,6 +367,8 @@ def main() -> None:
             f.write(msg + "\n")
 
     open(log_path, "w", encoding="utf-8").close()
+    run_started_at = datetime.now()
+    run_started_perf = perf_counter()
 
     model_name_for_log = base_model_id if args.base_only else str(args.checkpoint)
 
@@ -376,6 +380,7 @@ def main() -> None:
         system_prompt = "You are a helpful assistant."
 
     log("=== IFEval (Google Instruction Following Eval, rule-based) ===")
+    log(f"Run started at: {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"Source: {IFEVAL_REPO_PREFIX}")
     log(f"Model: {model_name_for_log}" + (" (base, no LoRA)" if args.base_only else ""))
     log(f"Base (for LoRA): {base_model_id}")
@@ -491,6 +496,11 @@ def main() -> None:
         json.dump(metrics_summary, f, indent=2, ensure_ascii=False)
     log(f"Saved {metrics_path}")
     log(f"Done. Artifacts in {out_dir}")
+    run_finished_at = datetime.now()
+    run_duration_sec = perf_counter() - run_started_perf
+    log(f"Run finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    log("Run status: SUCCESS")
+    log(f"Run duration: {run_duration_sec:.1f}s")
 
 
 if __name__ == "__main__":

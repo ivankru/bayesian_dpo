@@ -15,9 +15,11 @@ import math
 import os
 import random
 import re
+from datetime import datetime
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -1016,8 +1018,20 @@ def main():
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
 
+    open(log_path, "w", encoding="utf-8").close()
+    run_started_at = datetime.now()
+    run_started_perf = perf_counter()
+
+    def log_run_footer(status: str = "SUCCESS") -> None:
+        run_finished_at = datetime.now()
+        run_duration_sec = perf_counter() - run_started_perf
+        log(f"Run finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        log(f"Run status: {status}")
+        log(f"Run duration: {run_duration_sec:.1f}s")
+
     baseline_name = "GPT-4-turbo (reference)" if args.alpaca2 else "text_davinci_003"
     log("=== AlpacaEval (Qwen2.5-14B-Instruct judge) ===")
+    log(f"Run started at: {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"Mode: {'AlpacaEval 2.0 (vs GPT-4-turbo reference)' if args.alpaca2 else 'AlpacaEval (vs davinci-003)'}")
     log(f"Model: {model_name_for_log}" + (" (base, no LoRA)" if args.base_only else ""))
     log(f"Data: {args.data or (ALPACA_EVAL_V2_REFERENCE_URL if args.alpaca2 else ALPACA_EVAL_DATA_URL)}")
@@ -1092,6 +1106,7 @@ def main():
             max_instances=args.max_evals,
             log=log,
         )
+        log_run_footer()
         return
 
     # 3) Загрузка судьи и оценка (локальный Qwen2.5-14B)
@@ -1182,6 +1197,7 @@ def main():
         model_name=model_name_for_log,
         baseline_name=baseline_name,
     )
+    log_run_footer()
 
 
 if __name__ == "__main__":
