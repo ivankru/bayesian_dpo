@@ -50,6 +50,8 @@ def main(
     capability_ref_cache_path: Optional[str] = None,
     val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
     resume_start_epoch_1based: int = 1,
+    grad_clip_norm: float = 0.0,
+    optimizer_name: str = "AdamW",
 ):
     """
     resume_from: путь к чекпоинту (например "checkpoints/hard_dpo_steer/best").
@@ -120,6 +122,8 @@ def main(
         val_kl_mc_max_prompts=val_kl_mc_max_prompts,
         resume_start_epoch_1based=resume_start_epoch_1based,
         resume_checkpoint_dir=resume_from,
+        grad_clip_norm=grad_clip_norm,
+        optimizer_name=optimizer_name,
     )
 
 
@@ -128,6 +132,15 @@ def _lambda_min_type(x: str) -> float:
     if not 0.0 <= v <= 1.0:
         raise ValueError(f"--lambda-min must be in [0, 1], got {v}")
     return v
+
+
+def _optimizer_type(x: str) -> str:
+    v = str(x).strip().lower()
+    if v == "adamw":
+        return "AdamW"
+    if v == "sgd":
+        return "SGD"
+    raise ValueError(f"--optimizer must be one of: AdamW, SGD; got {x!r}")
 
 
 if __name__ == "__main__":
@@ -161,7 +174,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
+    parser.add_argument(
+        "--optimizer",
+        type=_optimizer_type,
+        default="AdamW",
+        help="Оптимизатор policy (case-insensitive): AdamW (по умолчанию) или SGD.",
+    )
     parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=0.0,
+        help="Max norm для clip_grad_norm_; 0 отключает клиппинг (по умолчанию: 0).",
+    )
     parser.add_argument(
         "--epochs",
         "-e",
@@ -218,6 +243,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         beta=args.beta,
+        optimizer_name=args.optimizer,
+        grad_clip_norm=args.grad_clip_norm,
         epochs=args.epochs,
         lambda_min=args.lambda_min,
         capability_eval_dir=args.capability_eval_dir,

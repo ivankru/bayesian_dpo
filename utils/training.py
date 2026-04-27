@@ -61,6 +61,7 @@ from utils.metrics import (
 from utils.val_distributions import compute_val_delta_distributions
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
+OPTIMIZER_CHOICES = ("adamw", "sgd")
 
 # MC forward KL(π‖ref) по сэмплам с π_θ; min(N, len(val)) промптов. 0 в val_kl_mc_max_prompts — отключить.
 DEFAULT_VAL_KL_MC_MAX_PROMPTS = 256
@@ -382,6 +383,8 @@ def _validate_train_dpo_args(
     resume_start_epoch_1based: int,
     resume_rewarmup_steps: int,
     resume_rewarmup_lr_floor: float,
+    grad_clip_norm: float,
+    optimizer_name: str,
 ) -> None:
     """Валидация аргументов train_dpo. Единая точка отказа с понятным сообщением."""
     if mode not in DPO_MODE_CHOICES:
@@ -415,6 +418,12 @@ def _validate_train_dpo_args(
     if resume_start_epoch_1based > epochs:
         raise ValueError(
             f"resume_start_epoch_1based={resume_start_epoch_1based} must be <= epochs={epochs}"
+        )
+    if grad_clip_norm < 0:
+        raise ValueError(f"grad_clip_norm must be >= 0, got {grad_clip_norm!r}")
+    if optimizer_name.lower() not in OPTIMIZER_CHOICES:
+        raise ValueError(
+            f"optimizer_name must be one of {OPTIMIZER_CHOICES}, got {optimizer_name!r}"
         )
 
 
@@ -509,6 +518,7 @@ def train_one_epoch_dpo(
     epoch_1based: int,
     global_step: int,
     loss_kw: Dict[str, Any],
+    grad_clip_norm: float = 0.0,
     log=print,
     use_mlflow: bool = False,
     mid_epoch_hook: Optional[Callable[[int], None]] = None,
@@ -573,7 +583,10 @@ def train_one_epoch_dpo(
             grad_abs_sum += g.abs().sum().item()
             grad_numel += g.numel()
         grad_abs_mean = grad_abs_sum / max(1, grad_numel)
-        torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                policy_model.parameters(), grad_clip_norm
+            )
         optimizer.step()
         scheduler.step()
 
@@ -684,6 +697,8 @@ def train_dpo(
     resume_checkpoint_dir: Optional[str] = None,
     resume_rewarmup_steps: int = 50,
     resume_rewarmup_lr_floor: float = 0.0,
+    grad_clip_norm: float = 0.0,
+    optimizer_name: str = "AdamW",
 ):
     """
     Универсальный цикл DPO: hard, soft или bayes.
@@ -740,6 +755,8 @@ def train_dpo(
         неустойчивые апдейты — этот ре-warmup сглаживает эффект. 0 отключает ре-warmup.
     resume_rewarmup_lr_floor: минимальная доля lr в момент возобновления (0.0 — старт
         буквально с нуля за N шагов; 0.05 — с 5% сразу).
+    grad_clip_norm: максимальная L2-норма градиента. 0 — без clip_grad_norm_ (дефолт).
+    optimizer_name: оптимизатор для policy_model: "AdamW" (дефолт) или "SGD".
     resume_start_epoch_1based: первая эпоха этого запуска (1-based, как в логах и epochs/epoch_XXX).
         Должно быть 1 <= resume_start_epoch_1based <= epochs. Веса из чекпоинта — после эпохи N-1
         (например после epoch_003 задайте 4).         При N>1 первая валидация — полный val как после эпохи (N-1): тот же заголовок/теги,
@@ -765,6 +782,8 @@ def train_dpo(
         resume_start_epoch_1based=resume_start_epoch_1based,
         resume_rewarmup_steps=resume_rewarmup_steps,
         resume_rewarmup_lr_floor=resume_rewarmup_lr_floor,
+        grad_clip_norm=grad_clip_norm,
+        optimizer_name=optimizer_name,
     )
     g0_start = resume_start_epoch_1based - 1
 
@@ -861,6 +880,8 @@ def train_dpo(
         "resume_checkpoint_dir": resume_checkpoint_dir,
         "resume_rewarmup_steps": resume_rewarmup_steps,
         "resume_rewarmup_lr_floor": resume_rewarmup_lr_floor,
+        "grad_clip_norm": grad_clip_norm,
+        "optimizer_name": optimizer_name,
     }
 
     with _mlflow_training_context(
@@ -1362,7 +1383,9 @@ def train_dpo(
             f"epochs_total={epochs}, epochs_this_run={epochs - g0_start}, "
             f"resume_start_epoch_1based={resume_start_epoch_1based}, "
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
-            f"p_pred_target_temperature={p_pred_target_temperature}, label_noise_prob={_lnp}, seed={seed}"
+            f"p_pred_target_temperature={p_pred_target_temperature}, "
+            f"optimizer={optimizer_name}, grad_clip_norm={grad_clip_norm}, "
+            f"label_noise_prob={_lnp}, seed={seed}"
         )
         log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
         log_msg(
@@ -1487,7 +1510,15 @@ def train_dpo(
                 mlflow_step=start_global_step,
             )
 
-        optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
+        optimizer_key = optimizer_name.lower()
+        if optimizer_key == "adamw":
+            optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
+        elif optimizer_key == "sgd":
+            optimizer = torch.optim.SGD(policy_model.parameters(), lr=lr)
+        else:  # защитный fallback; основной контроль — в _validate_train_dpo_args
+            raise ValueError(
+                f"Unsupported optimizer_name={optimizer_name!r}; expected one of {OPTIMIZER_CHOICES}"
+            )
         base_warmup_steps = max(10, num_training_steps // 20)
         do_resume_rewarmup = start_global_step > 0 and resume_rewarmup_steps > 0
 
@@ -1728,6 +1759,7 @@ def train_dpo(
                 g0 + 1,
                 global_step,
                 loss_kw=epoch_loss_kw,
+                grad_clip_norm=grad_clip_norm,
                 log=log_msg,
                 use_mlflow=use_mlflow,
                 mid_epoch_hook=mid_hook if mode != "hard" else None,

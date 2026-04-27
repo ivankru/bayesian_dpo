@@ -63,6 +63,8 @@ class SoftDPOConfig:
     use_bayes: bool = False
     batch_size: int = 8
     lr: float = 3e-5
+    optimizer_name: str = "AdamW"
+    grad_clip_norm: float = 0.0
     beta: float = 0.3
     epochs: int = 8
 
@@ -179,6 +181,8 @@ def main(cfg: SoftDPOConfig) -> None:
         epochs=cfg.epochs,
         batch_size=cfg.batch_size,
         lr=cfg.lr,
+        optimizer_name=cfg.optimizer_name,
+        grad_clip_norm=cfg.grad_clip_norm,
         beta=cfg.beta,
         alpha=cfg.alpha,
         output_dir=cfg.output_dir,
@@ -216,6 +220,15 @@ def _lambda_min_type(x: str) -> float:
     if not 0.0 <= v <= 1.0:
         raise ValueError(f"--lambda-min must be in [0, 1], got {v}")
     return v
+
+
+def _optimizer_type(x: str) -> str:
+    v = str(x).strip().lower()
+    if v == "adamw":
+        return "AdamW"
+    if v == "sgd":
+        return "SGD"
+    raise ValueError(f"--optimizer must be one of: AdamW, SGD; got {x!r}")
 
 
 def _parse_cli_to_config() -> SoftDPOConfig:
@@ -270,6 +283,18 @@ def _parse_cli_to_config() -> SoftDPOConfig:
     )
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate (по умолчанию: 3e-5).")
+    parser.add_argument(
+        "--optimizer",
+        type=_optimizer_type,
+        default="AdamW",
+        help="Оптимизатор policy (case-insensitive): AdamW (по умолчанию) или SGD.",
+    )
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=0.0,
+        help="Max norm для clip_grad_norm_; 0 отключает клиппинг (по умолчанию: 0).",
+    )
     parser.add_argument("--beta", type=float, default=0.3, help="Параметр beta для DPO loss (по умолчанию: 0.3).")
     parser.add_argument(
         "--epochs",
@@ -363,6 +388,8 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         dataset=args.dataset,
         batch_size=args.batch_size,
         lr=args.lr,
+        optimizer_name=args.optimizer,
+        grad_clip_norm=args.grad_clip_norm,
         beta=args.beta,
         epochs=args.epochs,
         lambda_min=args.lambda_min,
