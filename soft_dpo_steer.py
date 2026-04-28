@@ -348,7 +348,7 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         "--soft-loss-type",
         type=str,
         choices=["classic", "approximation", "centered_softplus"],
-        default="approximation",
+        default="classic",
         help=(
             "Вариант soft train-loss: classic=soft_dpo_classic_loss; "
             "approximation=soft_dpo_approximation_loss (scaled old_loss/beta, малобета-аппроксимация); "

@@ -330,6 +330,7 @@ def _build_loss_spec(
             f"Unknown soft_loss_type {soft_loss_type!r}. Available: {available}"
         ) from exc
     soft_loss_fn = get_loss(soft_loss_name)
+    soft_mode_label = "Bayes DPO" if use_bayes else "Soft DPO"
     return (
         collate_fn_soft,
         soft_loss_fn,
@@ -339,7 +340,7 @@ def _build_loss_spec(
             "use_chat_template": use_chat_template,
             "p_pred_target_temperature": p_pred_target_temperature,
         },
-        "Bayes DPO" if use_bayes else "Soft DPO",
+        f"{soft_mode_label} ({soft_loss_type})",
     )
 
 
@@ -1378,8 +1379,11 @@ def train_dpo(
         log_msg(f"Run started at: {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
         log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
         _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
+        mode_log = (
+            f"{mode}({soft_loss_type})" if mode in ("soft", "bayes") else mode
+        )
         log_msg(
-            f"Старт train_dpo: mode={mode}, beta={beta}, lr={lr}, batch_size={batch_size}, "
+            f"Старт train_dpo: mode={mode_log}, beta={beta}, lr={lr}, batch_size={batch_size}, "
             f"epochs_total={epochs}, epochs_this_run={epochs - g0_start}, "
             f"resume_start_epoch_1based={resume_start_epoch_1based}, "
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
@@ -1511,10 +1515,13 @@ def train_dpo(
             )
 
         optimizer_key = optimizer_name.lower()
+        sgd_momentum = 0.9
         if optimizer_key == "adamw":
             optimizer = torch.optim.AdamW(policy_model.parameters(), lr=lr)
         elif optimizer_key == "sgd":
-            optimizer = torch.optim.SGD(policy_model.parameters(), lr=lr)
+            optimizer = torch.optim.SGD(
+                policy_model.parameters(), lr=lr, momentum=sgd_momentum
+            )
         else:  # защитный fallback; основной контроль — в _validate_train_dpo_args
             raise ValueError(
                 f"Unsupported optimizer_name={optimizer_name!r}; expected one of {OPTIMIZER_CHOICES}"
