@@ -1377,14 +1377,16 @@ def train_dpo(
 
         log_msg(f"=== {mode_label} ===")
         log_msg(f"Run started at: {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
-        log_msg(f"Model: {model_name or 'N/A'}, Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, val size: {len(val_ds)}")
-        _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
-        mode_log = (
-            f"{mode}({soft_loss_type})" if mode in ("soft", "bayes") else mode
-        )
+        log_msg(f"Model: {model_name or 'N/A'}")
         log_msg(
-            f"Старт train_dpo: mode={mode_log}, beta={beta}, lr={lr}, batch_size={batch_size}, "
-            f"epochs_total={epochs}, seed={seed}\n"
+            f"Dataset: {dataset_name or 'N/A'}, train size: {len(train_ds)}, "
+            f"val size: {len(val_ds)}, batch_size={batch_size}"
+        )
+        _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
+        loss_log = soft_loss_type if mode in ("soft", "bayes") else mode
+        log_msg(
+            f"Старт train_dpo: loss={loss_log}, epochs_total={epochs}, seed={seed}\n"
+            f"beta={beta}, lr={lr},\n"
             f"epochs_this_run={epochs - g0_start}, resume_start_epoch_1based={resume_start_epoch_1based}\n"
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
             f"p_pred_target_temperature={p_pred_target_temperature}, label_noise_prob={_lnp}\n"
