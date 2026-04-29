@@ -1384,12 +1384,11 @@ def train_dpo(
         )
         log_msg(
             f"Старт train_dpo: mode={mode_log}, beta={beta}, lr={lr}, batch_size={batch_size}, "
-            f"epochs_total={epochs}, epochs_this_run={epochs - g0_start}, "
-            f"resume_start_epoch_1based={resume_start_epoch_1based}, "
+            f"epochs_total={epochs}, seed={seed}\n"
+            f"epochs_this_run={epochs - g0_start}, resume_start_epoch_1based={resume_start_epoch_1based}\n"
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
-            f"p_pred_target_temperature={p_pred_target_temperature}, "
-            f"optimizer={optimizer_name}, grad_clip_norm={grad_clip_norm}, "
-            f"label_noise_prob={_lnp}, seed={seed}"
+            f"p_pred_target_temperature={p_pred_target_temperature}, label_noise_prob={_lnp}\n"
+            f"optimizer={optimizer_name}, grad_clip_norm={grad_clip_norm}"
         )
         log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
         log_msg(

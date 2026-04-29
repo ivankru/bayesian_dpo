@@ -10,10 +10,10 @@ Monte Carlo оценка forward KL(π_θ || π_ref) по сэмплам y ~ π_
 from typing import Dict, List, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from .dpo_logps import get_logps
-
 
 def _effective_tokenizer_cap(tokenizer) -> int:
     """Верхняя граница длины для truncation из tokenizer; без привязки к MAX_PROMPT_LEN в config."""
@@ -31,12 +31,7 @@ def get_logps_generated(
     device: str,
     use_chat_template: bool = False,
 ) -> torch.Tensor:
-    """
-    log p(response | prompt) для произвольных строковых пар (в т.ч. после decode сгенерированных токенов).
-
-    Делегирует в get_logps с max_prompt_len=max_full_len=ef_cap, где ef_cap из tokenizer.model_max_length
-    (с разумной планкой), чтобы не отрезать ответ при типичных длинах генерации.
-    """
+    """Backward-compatible helper for callers importing this symbol from utils.metrics."""
     cap = _effective_tokenizer_cap(tokenizer)
     return get_logps(
         model,
@@ -50,22 +45,60 @@ def get_logps_generated(
     )
 
 
-def _count_response_tokens(
-    tokenizer,
-    responses: List[str],
-) -> List[int]:
-    """Число токенов ответа (без обрезки и паддинга) для per-token нормализации KL-MC.
-
-    Использует ту же токенизацию без специальных токенов, что и get_logps в chat-template
-    ветке; даёт верхнюю оценку числа токенов, по которым берётся log p. Для согласованности с
-    get_logps при чрезмерно длинных ответах (> max_full_len - prefix) можно было бы учесть
-    обрезку, но для KL-MC (cap ~8192) обрезка крайне редка при max_new_tokens порядка сотен.
+def _sum_logprobs_on_generated_suffix(
+    model,
+    seq_ids: torch.Tensor,
+    seq_attn: torch.Tensor,
+    *,
+    suffix_start: int,
+    pad_token_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    out: List[int] = []
-    for r in responses:
-        ids = tokenizer(r, add_special_tokens=False)["input_ids"]
-        out.append(max(1, len(ids)))
-    return out
+    Считает сумму log p(y_t | x, y_<t>) по суффиксу y = seq_ids[:, suffix_start:].
+    Возвращает:
+      - seq_logp: [B] суммарные лог-вероятности по суффиксу
+      - tok_count: [B] число учтённых токенов в суффиксе
+    """
+    # logits[:, t-1] predicts token at position t
+    out = model(input_ids=seq_ids, attention_mask=seq_attn)
+    logprobs = F.log_softmax(out.logits, dim=-1)
+
+    tgt = seq_ids[:, suffix_start:]
+    if tgt.numel() == 0:
+        bsz = seq_ids.size(0)
+        z = torch.zeros(bsz, device=seq_ids.device, dtype=logprobs.dtype)
+        return z, z.to(torch.long)
+
+    # predictor positions are shifted by -1
+    pred = logprobs[:, suffix_start - 1 : -1, :]
+    tok_lp = pred.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+
+    # ignore right-padding introduced after EOS
+    valid = (tgt != pad_token_id).to(tok_lp.dtype)
+    seq_logp = (tok_lp * valid).sum(dim=1)
+    tok_count = valid.sum(dim=1).to(torch.long)
+    return seq_logp, tok_count
+
+
+def _build_full_attention_mask(
+    base_attention_mask: torch.Tensor,
+    generated: torch.Tensor,
+) -> torch.Tensor:
+    """
+    base_attention_mask: [B, Tin]
+    generated: [B*K, Tout] where Tout >= Tin
+    Возвращает attention mask [B*K, Tout]:
+      - первые Tin позиций: повторённая base mask
+      - для сгенерированного хвоста: единицы
+    """
+    b = base_attention_mask.size(0)
+    bk = generated.size(0)
+    k = bk // b
+    tin = base_attention_mask.size(1)
+    tout = generated.size(1)
+    rep = base_attention_mask.repeat_interleave(k, dim=0)
+    tail = torch.ones((bk, max(0, tout - tin)), dtype=rep.dtype, device=rep.device)
+    return torch.cat([rep, tail], dim=1)
 
 
 def estimate_val_kl_mc(
@@ -181,39 +214,36 @@ def estimate_val_kl_mc(
                 generated = policy_model.generate(**inputs, **gen_kwargs)
                 in_len = inputs["input_ids"].shape[1]
                 b_times_k = generated.shape[0]
+                full_attn = _build_full_attention_mask(inputs["attention_mask"], generated)
 
                 for sub in range(0, b_times_k, logp_score_batch_size):
                     sub_end = min(sub + logp_score_batch_size, b_times_k)
-                    mp: List[str] = []
-                    mr: List[str] = []
-                    for idx in range(sub, sub_end):
-                        p_ix = idx // num_samples_per_prompt
-                        gen_ids = generated[idx, in_len:]
-                        resp_text = tokenizer.decode(
-                            gen_ids, skip_special_tokens=True
-                        )
-                        mp.append(batch_prompts[p_ix])
-                        mr.append(resp_text)
+                    gen_sub = generated[sub:sub_end]
+                    attn_sub = full_attn[sub:sub_end]
 
-                    log_pi = get_logps_generated(
+                    log_pi, tok_pi = _sum_logprobs_on_generated_suffix(
                         policy_model,
-                        tokenizer,
-                        mp,
-                        mr,
-                        device,
-                        use_chat_template=use_chat_template,
+                        gen_sub,
+                        attn_sub,
+                        suffix_start=in_len,
+                        pad_token_id=tokenizer.pad_token_id,
                     )
-                    log_ref = get_logps_generated(
+                    log_ref, tok_ref = _sum_logprobs_on_generated_suffix(
                         ref_model,
-                        tokenizer,
-                        mp,
-                        mr,
-                        device,
-                        use_chat_template=use_chat_template,
+                        gen_sub,
+                        attn_sub,
+                        suffix_start=in_len,
+                        pad_token_id=tokenizer.pad_token_id,
                     )
+
+                    if not torch.equal(tok_pi, tok_ref):
+                        raise RuntimeError(
+                            "KL_MC token-count mismatch between policy/ref scoring"
+                        )
+
                     total_log_ratio += (log_pi - log_ref).sum().item()
-                    total_count += len(mp)
-                    total_resp_tokens += sum(_count_response_tokens(tokenizer, mr))
+                    total_count += int(gen_sub.size(0))
+                    total_resp_tokens += int(tok_pi.sum().item())
 
     finally:
         tokenizer.padding_side = saved_padding_side
