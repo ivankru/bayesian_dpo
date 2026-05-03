@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AlpacaEval: оценка DPO-моделей с судьёй Qwen2.5-14B-Instruct.
+AlpacaEval: evaluate DPO models with a Qwen2.5-14B-Instruct judge.
 
-Загружает инструкции и ответы baseline (text_davinci_003 или GPT-4-turbo в режиме AlpacaEval 2.0),
-генерирует ответы вашей моделью из чекпоинта, затем судья сравнивает
-пары (baseline, model) и считается win rate и length-controlled win rate.
+Loads instructions and baseline outputs (text_davinci_003 or GPT-4-turbo in AlpacaEval 2.0 mode),
+generates completions with your checkpoint, then the judge compares
+(baseline, model) pairs and reports win rate and length-controlled win rate.
 """
 from __future__ import annotations
 
@@ -28,28 +28,28 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def is_cuda_device(device) -> bool:
-    """True для 'cuda', 'cuda:0', torch.device('cuda', 1) и т.п."""
+    """True for 'cuda', 'cuda:0', torch.device('cuda', 1), etc."""
     if isinstance(device, torch.device):
         return device.type == "cuda"
     return isinstance(device, str) and device.startswith("cuda")
 
-# URL эталонных данных AlpacaEval (instruction + output от text_davinci_003)
+# AlpacaEval reference data URL (instruction + output from text_davinci_003)
 ALPACA_EVAL_DATA_URL = (
     "https://huggingface.co/datasets/tatsu-lab/alpaca_eval/resolve/main/alpaca_eval.json"
 )
-# AlpacaEval 2.0: reference-ответы GPT-4 (gpt-4-1106-preview / GPT-4-turbo)
+# AlpacaEval 2.0: GPT-4 reference outputs (gpt-4-1106-preview / GPT-4-turbo)
 ALPACA_EVAL_V2_REFERENCE_URL = (
     "https://huggingface.co/datasets/tatsu-lab/alpaca_eval/resolve/main/alpaca_eval_gpt4_baseline.json"
 )
 
 JUDGE_MODEL = "Qwen/Qwen2.5-14B-Instruct"
-# Базовые модели для кандидата (оценка без LoRA или база для LoRA)
+# Base models for the candidate (evaluate without LoRA or as LoRA base)
 BASE_MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
 BASE_MODEL_7B = "Qwen/Qwen2.5-7B-Instruct"
-BASE_MODEL = BASE_MODEL_3B  # по умолчанию
+BASE_MODEL = BASE_MODEL_3B  # default
 BASE_MODEL_CHOICES = {"3b": BASE_MODEL_3B, "7b": BASE_MODEL_7B}
 
-# Шаблон промпта судьи (AlpacaEval-style, ChatML для Qwen)
+# Judge prompt template (AlpacaEval-style, ChatML for Qwen)
 JUDGE_SYSTEM = (
     "You are a helpful assistant, that ranks models by the quality of their answers."
 )
@@ -82,7 +82,7 @@ Your response must be a valid Python dictionary and should contain nothing else 
 
 
 def load_alpaca_eval_data(path: Optional[str] = None) -> List[Dict[str, str]]:
-    """Загружает данные AlpacaEval: список {instruction, output} (baseline)."""
+    """Load AlpacaEval data: list of {instruction, output} (baseline)."""
     if path and os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -93,7 +93,7 @@ def load_alpaca_eval_data(path: Optional[str] = None) -> List[Dict[str, str]]:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             raise FileNotFoundError(
-                f"Не найден файл {path!r} и не удалось скачать {ALPACA_EVAL_DATA_URL}: {e}"
+                f"File not found at {path!r} and failed to download {ALPACA_EVAL_DATA_URL}: {e}"
             ) from e
 
     out = []
@@ -108,7 +108,7 @@ def load_alpaca_eval_data(path: Optional[str] = None) -> List[Dict[str, str]]:
 
 
 def _load_json_from_path_or_url(path: Optional[str], url: str, desc: str) -> List[Dict[str, Any]]:
-    """Загружает JSON: из файла path или по URL."""
+    """Load JSON from file path or URL."""
     if path and os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -118,7 +118,7 @@ def _load_json_from_path_or_url(path: Optional[str], url: str, desc: str) -> Lis
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         raise FileNotFoundError(
-            f"{desc}: не найден файл {path!r} и не удалось скачать {url}: {e}"
+            f"{desc}: file not found at {path!r} and failed to download {url}: {e}"
         ) from e
 
 
@@ -126,9 +126,9 @@ def load_alpaca_eval_v2_data(
     data_dir: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
-    Загружает данные в формате AlpacaEval 2.0: инструкции из alpaca_eval.json,
-    reference-ответы — из alpaca_eval_gpt4_baseline.json (GPT-4-turbo / gpt-4-1106-preview).
-    Возвращает список {instruction, output}, где output — ответ reference-модели.
+    Load AlpacaEval 2.0 format: instructions from alpaca_eval.json,
+    reference outputs from alpaca_eval_gpt4_baseline.json (GPT-4-turbo / gpt-4-1106-preview).
+    Returns list of {instruction, output} where output is the reference model reply.
     """
     if data_dir and os.path.isdir(data_dir):
         path_instructions = os.path.join(data_dir, "alpaca_eval.json")
@@ -143,7 +143,7 @@ def load_alpaca_eval_v2_data(
         path_reference, ALPACA_EVAL_V2_REFERENCE_URL, "AlpacaEval 2.0 GPT-4 reference"
     )
 
-    # Нормализуем в списки {instruction, output, dataset}
+    # Normalize to lists of {instruction, output, dataset}
     instructions_list = []
     for item in instructions_data:
         if isinstance(item, dict) and "instruction" in item:
@@ -158,14 +158,14 @@ def load_alpaca_eval_v2_data(
         if isinstance(item, dict) and "instruction" in item and "output" in item:
             ref_by_instruction[item["instruction"]] = item["output"]
 
-    # Сопоставляем по instruction (порядок — по instructions_list)
+    # Match by instruction (order follows instructions_list)
     out = []
     for rec in instructions_list:
         inst = rec["instruction"]
         ref_out = ref_by_instruction.get(inst)
         if ref_out is None:
             raise ValueError(
-                f"AlpacaEval 2.0: для инструкции не найден reference в alpaca_eval_gpt4_baseline.json: {inst[:80]}..."
+                f"AlpacaEval 2.0: no reference for instruction in alpaca_eval_gpt4_baseline.json: {inst[:80]}..."
             )
         out.append({"instruction": inst, "output": ref_out, "dataset": rec["dataset"]})
     return out
@@ -173,9 +173,9 @@ def load_alpaca_eval_v2_data(
 
 def _find_checkpoint_in_dataset_subdir(missing: Path) -> Optional[Path]:
     """
-    Обучающие скрипты кладут чекпоинты в checkpoints/<dataset>/<run>/best.
-    Если передан несуществующий checkpoints/<run>/best, ищем единственный
-    checkpoints/*/<run>/best под тем же checkpoints/.
+    Training scripts store checkpoints under checkpoints/<dataset>/<run>/best.
+    If checkpoints/<run>/best does not exist, look for the unique
+    checkpoints/*/<run>/best under the same checkpoints/ root.
     """
     if missing.name != "best":
         return None
@@ -188,7 +188,7 @@ def _find_checkpoint_in_dataset_subdir(missing: Path) -> Optional[Path]:
             break
     if checkpoints_root is None or not checkpoints_root.is_dir():
         return None
-    # Уже был бы валидный путь: checkpoints/<ds>/<run>/best
+    # Would already be a valid path: checkpoints/<ds>/<run>/best
     if run_dir.parent != checkpoints_root:
         return None
     found: List[Path] = []
@@ -209,7 +209,7 @@ def load_candidate_model(
     base_model: str = BASE_MODEL,
     device: Optional[str] = None,
 ):
-    """Загружает модель из чекпоинта (база + LoRA). Токенайзер берётся из base_model, чтобы избежать ошибок при неполных файлах в чекпоинте."""
+    """Load model from checkpoint (base + LoRA). Tokenizer comes from base_model to avoid errors with incomplete checkpoint files."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     use_cuda = is_cuda_device(device)
@@ -225,18 +225,18 @@ def load_candidate_model(
         recovered = _find_checkpoint_in_dataset_subdir(ckpt_path)
         if recovered is not None:
             print(
-                f"Чекпоинт: каталог по указанному пути не найден, используется {recovered}",
+                f"Checkpoint: directory not found at given path, using {recovered}",
                 flush=True,
             )
             ckpt_path = recovered
     checkpoint_dir = str(ckpt_path)
     if not ckpt_path.is_dir():
         raise FileNotFoundError(
-            f"Каталог чекпоинта не найден: {checkpoint_arg_raw!r} → {checkpoint_dir!r} "
-            f"(текущая рабочая директория: {os.getcwd()!r}). "
-            "Частая причина: чекпоинт лежит в checkpoints/<датасет>/<run>/best "
-            "(например checkpoints/hhrlf/hard_hhrlf_lr1_5e5_beta01/best), а не в checkpoints/<run>/best. "
-            "Укажите полный путь или запустите скрипт из каталога, относительно которого корректен относительный путь."
+            f"Checkpoint directory not found: {checkpoint_arg_raw!r} → {checkpoint_dir!r} "
+            f"(current working directory: {os.getcwd()!r}). "
+            "Common case: checkpoint lives under checkpoints/<dataset>/<run>/best "
+            "(e.g. checkpoints/hhrlf/hard_hhrlf_lr1_5e5_beta01/best), not checkpoints/<run>/best. "
+            "Pass an absolute path or run the script from a directory where the relative path resolves."
         )
 
     adapter_cfg = ckpt_path / "adapter_config.json"
@@ -267,8 +267,8 @@ def load_candidate_model(
         return tokenizer, model, device
 
     raise FileNotFoundError(
-        f"В {checkpoint_dir!r} нет adapter_config.json (адаптер LoRA) "
-        "и нет config.json (полная модель). Проверьте путь к чекпоинту."
+        f"{checkpoint_dir!r} has neither adapter_config.json (LoRA adapter) "
+        "nor config.json (full model). Check the checkpoint path."
     )
 
 
@@ -276,7 +276,7 @@ def load_base_model(
     base_model: str = BASE_MODEL,
     device: Optional[str] = None,
 ):
-    """Загружает базовую модель без LoRA (для оценки Qwen2.5-3B-Instruct без finetuning)."""
+    """Load base model without LoRA (for evaluating Qwen2.5-3B-Instruct without finetuning)."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     use_cuda = is_cuda_device(device)
@@ -300,11 +300,11 @@ def load_base_model(
 
 def load_judge_model(device: Optional[str] = None):
     """
-    Загружает модель-судью Qwen2.5-14B-Instruct.
+    Load judge model Qwen2.5-14B-Instruct.
 
-    На CUDA используем device_map='auto', чтобы Accelerate распределил веса между
-    доступными GPU (14B в bf16 ~ 28 GB не всегда влезает в одну карту). На CPU
-    — обычная загрузка.
+    On CUDA use device_map='auto' so Accelerate can shard weights across
+    available GPUs (14B bf16 ~28 GB may not fit on one card). On CPU use
+    ordinary single-device load.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -330,7 +330,7 @@ def load_judge_model(device: Optional[str] = None):
 
 
 def _clear_unsupported_generation_config(model) -> None:
-    """Убирает top_p/top_k из generation_config, чтобы не было предупреждений о невалидных флагах."""
+    """Clear top_p/top_k from generation_config to avoid invalid-flag warnings."""
     if getattr(model, "generation_config", None) is not None:
         for key in ("top_p", "top_k"):
             if hasattr(model.generation_config, key):
@@ -338,7 +338,7 @@ def _clear_unsupported_generation_config(model) -> None:
 
 
 def _input_device_for(model, fallback) -> Any:
-    """Куда класть тензоры: при device_map='auto' это устройство embed_tokens."""
+    """Device for input tensors; with device_map='auto' this is embed_tokens' device."""
     dev = getattr(model, "device", None)
     if dev is not None:
         return dev
@@ -368,11 +368,11 @@ def generate_responses(
     system_prompt: Optional[str] = "You are a helpful assistant.",
 ) -> List[str]:
     """
-    Генерирует ответы модели на список инструкций.
+    Generate model completions for a list of instructions.
 
-    Важно: для авторегрессивной генерации с padding нужно left-padding.
-    Иначе при batch_size > 1 модель видит pad-токены в середине prompt и
-    выдаёт мусор.
+    Important: autoregressive generation with padding requires left-padding.
+    Otherwise with batch_size > 1 the model sees pad tokens inside the prompt
+    and outputs garbage.
     """
     model.eval()
     _clear_unsupported_generation_config(model)
@@ -415,8 +415,8 @@ def generate_responses(
                 eos_token_id=tokenizer.eos_token_id,
             )
 
-        # Вырезаем только сгенерированную часть. При left-padding длины prompt
-        # одинаковы для всего батча и равны inputs.input_ids.size(1).
+        # Keep only generated tokens. With left-padding, prompt lengths match
+        # for the whole batch and equal inputs.input_ids.size(1).
         prompt_len = inputs.input_ids.size(1)
         for out_ids in out:
             gen_ids = out_ids[prompt_len:]
@@ -427,7 +427,7 @@ def generate_responses(
 
 
 def build_judge_messages(instruction: str, output_1: str, output_2: str) -> List[Dict[str, str]]:
-    """Сообщения для судьи: instruction и два ответа (model_1, model_2)."""
+    """Messages for the judge: instruction and two answers (model_1, model_2)."""
     user_text = (
         JUDGE_USER_TEMPLATE.replace("__INSTRUCTION__", instruction)
         .replace("__OUTPUT_1__", output_1)
@@ -440,21 +440,21 @@ def build_judge_messages(instruction: str, output_1: str, output_2: str) -> List
 
 
 def parse_judge_ranking(response: str) -> Optional[Dict[str, int]]:
-    """Парсит ответ судьи: {'model_1': rank, 'model_2': rank} или None."""
-    # Ищем список вида [{'model': 'model_1', 'rank': 1}, ...]
+    """Parse judge reply: {'model_1': rank, 'model_2': rank} or None."""
+    # Look for a list like [{'model': 'model_1', 'rank': 1}, ...]
     response = response.strip()
-    # Убираем markdown code block если есть
+    # Strip markdown code fence if present
     if "```" in response:
         for part in response.split("```"):
             if "model" in part and "rank" in part:
                 response = part
                 break
-    # Найти список словарей
+    # Find list of dicts
     list_match = re.search(r"\[\s*\{[^]]+\}\s*\]", response, re.DOTALL)
     if not list_match:
         return None
     try:
-        # Заменить одинарные кавычки для совместимости с JSON
+        # Replace single quotes for JSON compatibility
         s = list_match.group(0).replace("'", '"')
         arr = json.loads(s)
         ranking = {}
@@ -478,13 +478,13 @@ def run_judge(
     max_new_tokens: int = 96,
 ) -> Tuple[Optional[int], str]:
     """
-    Запускает судью с двумя ответами в фиксированных слотах model_1 / model_2.
-    Возвращает (rank_of_output_2, raw_response):
-      rank_of_output_2 == 1 -> output_2 лучше,
-      rank_of_output_2 == 2 -> output_1 лучше,
-      None — не удалось распарсить.
-    Решение, какой из output'ов — кандидат, принимается на уровне выше
-    (в compute_win_rate; так удобно рандомизировать порядок).
+    Run judge with two completions in fixed slots model_1 / model_2.
+    Returns (rank_of_output_2, raw_response):
+      rank_of_output_2 == 1 -> output_2 preferred,
+      rank_of_output_2 == 2 -> output_1 preferred,
+      None -> parse failed.
+    Which output is the candidate is decided higher up (in compute_win_rate)
+    so slot order can be randomized.
     """
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -534,15 +534,14 @@ def compute_win_rate(
     seed: int = 0,
 ) -> Tuple[float, float, float, List[Dict[str, Any]]]:
     """
-    Запускает судью по всем парам и считает win / tie / loss.
+    Run judge on all pairs and compute win / tie / loss.
 
-    Чтобы убрать положенный LLM-судьям position bias (кандидат всегда
-    в одном слоте), рандомизируем порядок (model_1 vs model_2) для каждой
-    пары; нормализация — на уровне rank_candidate.
+    To reduce LLM-judge position bias (candidate always in one slot),
+    randomize (model_1 vs model_2) per pair; normalize via rank_candidate.
 
-    Возвращает (win_rate, tie_rate, loss_rate, results), где results — записи
-    с инструкцией, ответами, какой слот занимал кандидат, нормализованным
-    rank_candidate (1=cand лучше, 2=baseline лучше) и сырым ответом судьи.
+    Returns (win_rate, tie_rate, loss_rate, results) where results are rows
+    with instruction, outputs, candidate slot, normalized rank_candidate
+    (1=candidate wins, 2=baseline wins), and raw judge text.
     """
     n = len(eval_data)
     if max_evals is not None:
@@ -572,7 +571,7 @@ def compute_win_rate(
             output_2,
         )
 
-        # Нормализуем: rank_candidate = 1, если победил кандидат, 2 — если baseline.
+        # Normalize: rank_candidate = 1 if candidate wins, 2 if baseline wins.
         if rank_output_2 is None:
             rank_candidate: Optional[int] = None
         elif cand_first:
@@ -605,7 +604,7 @@ def compute_win_rate(
 
 
 def win_rate_standard_error(win_rate: float, n: int) -> float:
-    """Стандартная ошибка для доли (binomial SE). AlpacaEval использует для доверительных интервалов."""
+    """Standard error for a proportion (binomial SE). AlpacaEval uses this for confidence intervals."""
     if n <= 0:
         return 0.0
     return math.sqrt(win_rate * (1.0 - win_rate) / n)
@@ -621,7 +620,7 @@ def print_metrics(
     model_name: str = "candidate",
     baseline_name: str = "baseline",
 ) -> None:
-    """Печатает основные метрики AlpacaEval на экран."""
+    """Print core AlpacaEval metrics to stdout."""
     se = win_rate_standard_error(win_rate, n)
     print("\n" + "=" * 56, flush=True)
     print("  ALPACAEVAL METRICS", flush=True)
@@ -653,11 +652,11 @@ def compute_length_filtered_win_rate(
     length_ratio_max: float = 1.1,
 ) -> float:
     """
-    Простой length-filtered win rate (НЕ LC-WR из AlpacaEval 2.0!):
-    оставляем только пары, где длина ответа кандидата (в символах)
-    не больше baseline * length_ratio_max, и считаем win-rate по ним.
+    Simple length-filtered win rate (NOT AlpacaEval 2.0 LC-WR):
+    keep only pairs where candidate length (characters)
+    is at most baseline * length_ratio_max, then compute win rate.
 
-    Эвристика; для настоящей length-controlled метрики см.
+    Heuristic; for a proper length-controlled metric see
     compute_length_controlled_win_rate_glm.
     """
     wins = losses = ties = 0
@@ -687,21 +686,21 @@ def compute_length_controlled_win_rate_glm(
     tokenizer=None,
 ) -> Dict[str, float]:
     """
-    Length-controlled win rate в духе AlpacaEval 2.0 (Dubois et al., 2024,
-    arXiv:2404.04475), упрощённый для пары "одна модель vs reference".
+    Length-controlled win rate in the spirit of AlpacaEval 2.0 (Dubois et al., 2024,
+    arXiv:2404.04475), simplified for one model vs reference.
 
-    Фитим логистическую регрессию по парам:
+    Fit logistic regression on pairs:
         logit P(candidate beats baseline | x) = theta + beta * z(len_cand - len_baseline)
-    где z(.) — стандартизация (вычитаем среднее, делим на std). Tie трактуется
-    как 0.5 (полупобеда). Длина — в символах (по умолчанию, как в оригинале)
-    либо в токенах (если передан tokenizer).
+    where z(.) standardizes (subtract mean, divide by std). Ties count as
+    0.5 (half win). Length is in characters by default (as in the paper)
+    or in tokens if a tokenizer is passed.
 
-    LC-WR = sigmoid(theta + beta * z(0)), т.е. предсказанный win-rate при
-    нулевой разнице длин.
+    LC-WR = sigmoid(theta + beta * z(0)), i.e. predicted win rate at
+    zero length difference.
 
-    Это упрощение: оригинальная alpaca_eval.metrics.glm_winrate.py добавляет
-    instruction random effect (instruction_difficulty); у нас по 1 наблюдению
-    на инструкцию, поэтому этот член тождественно нулевой.
+    Simplification: alpaca_eval.metrics.glm_winrate.py adds an instruction
+    random effect (instruction_difficulty); we have one observation per
+    instruction, so that term is identically zero here.
     """
     import numpy as np
 
@@ -751,7 +750,7 @@ def compute_length_controlled_win_rate_glm(
     mu = float(x.mean())
     sd = float(x.std())
     if sd < 1e-8:
-        # Разница длин константна — длина не вносит сигнал, LC-WR = raw win rate.
+        # Length difference is constant — no length signal, LC-WR = raw win rate.
         return {
             "length_controlled_win_rate": raw_wr,
             "raw_win_rate": raw_wr,
@@ -767,7 +766,7 @@ def compute_length_controlled_win_rate_glm(
     def neg_log_lik(params):
         theta, beta = params
         logits = theta + beta * z
-        # Стабильная log-likelihood Бернулли с y in [0,1]:
+        # Stable Bernoulli log-likelihood with y in [0,1]:
         # log p(y) = y*log sigmoid(l) + (1-y)*log(1-sigmoid(l))
         #         = -y*softplus(-l) - (1-y)*softplus(l)
         sp_neg = np.logaddexp(0.0, -logits)  # softplus(-l)
@@ -793,7 +792,7 @@ def compute_length_controlled_win_rate_glm(
         )
         theta_hat, beta_hat = float(res.x[0]), float(res.x[1])
     except Exception:
-        # Простой Newton fallback
+        # Simple Newton fallback
         theta_hat, beta_hat = 0.0, 0.0
         for _ in range(200):
             g = grad(np.array([theta_hat, beta_hat]))
@@ -838,18 +837,18 @@ def _run_official_alpaca_eval(
     log: Any,
 ) -> None:
     """
-    Оценка через официальную библиотеку alpaca_eval (pip install alpaca-eval).
-    Использует аннотатор по умолчанию (GPT-4 и т.д.); нужен OPENAI_API_KEY.
+    Evaluation via official alpaca_eval library (pip install alpaca-eval).
+    Uses the default annotator (GPT-4, etc.); requires OPENAI_API_KEY.
     """
     try:
         import pandas as pd
         import alpaca_eval
     except ImportError as e:
-        log("Ошибка: для --alpaca-eval-lib нужна библиотека alpaca_eval.")
-        log("Установите: pip install alpaca-eval")
+        log("Error: --alpaca-eval-lib requires the alpaca_eval package.")
+        log("Install: pip install alpaca-eval")
         raise SystemExit(1) from e
 
-    # reference_outputs в том же порядке, что и model_outputs (baseline из наших данных)
+    # reference_outputs same order as model_outputs (baseline from our data)
     reference_outputs = [
         {
             "instruction": d["instruction"],
@@ -869,7 +868,7 @@ def _run_official_alpaca_eval(
         max_instances=max_instances,
     )
 
-    # Печать метрик на экран (как выводит сама библиотека)
+    # Print metrics like the library would
     if model_name in df_leaderboard.index:
         row = df_leaderboard.loc[model_name]
     elif len(df_leaderboard) == 1:
@@ -898,109 +897,109 @@ def _run_official_alpaca_eval(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AlpacaEval: оценка модели судьёй Qwen2.5-14B-Instruct"
+        description="AlpacaEval: evaluate a model with Qwen2.5-14B-Instruct judge"
     )
     parser.add_argument(
         "--checkpoint",
         "-c",
         type=str,
         default=None,
-        help="Путь к чекпоинту модели (например checkpoints/hard_dpo_steer/best). При --base-only не используется.",
+        help="Path to model checkpoint (e.g. checkpoints/hard_dpo_steer/best). Unused with --base-only.",
     )
     parser.add_argument(
         "--base-only",
         action="store_true",
-        help="Оценить базовую модель без LoRA (--checkpoint при этом не имеет смысла и игнорируется).",
+        help="Evaluate base model without LoRA (--checkpoint is then meaningless and ignored).",
     )
     parser.add_argument(
         "--base-model",
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="Базовая модель для кандидата: 3b (Qwen2.5-3B-Instruct) или 7b (Qwen2.5-7B-Instruct). По умолчанию: 3b.",
+        help="Base model for candidate: 3b (Qwen2.5-3B-Instruct) or 7b (Qwen2.5-7B-Instruct). Default: 3b.",
     )
     parser.add_argument(
         "--data",
         "-d",
         type=str,
         default=None,
-        help="Путь к alpaca_eval.json (instruction + baseline output). По умолчанию — скачать с HF.",
+        help="Path to alpaca_eval.json (instruction + baseline output). Default: download from HF.",
     )
     parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="Папка для сохранения: логи, candidate outputs JSON.",
+        help="Output directory: logs, candidate outputs JSON.",
     )
     parser.add_argument(
         "--max-evals",
         type=int,
         default=None,
-        help="Макс. число примеров для оценки (для отладки).",
+        help="Max examples to evaluate (debug).",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
-        help="Макс. токенов генерации ответа модели.",
+        help="Max new tokens for model completion generation.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
-        help="Размер батча для генерации ответов модели.",
+        help="Batch size for model completion generation.",
     )
     parser.add_argument(
         "--do-sample",
         action="store_true",
-        help="Использовать сэмплирование при генерации (temperature 0.6).",
+        help="Use sampling during generation (temperature 0.6).",
     )
     parser.add_argument(
         "--length-controlled",
         action="store_true",
         help=(
-            "Дополнительно посчитать length-controlled win rate (GLM в духе "
-            "AlpacaEval 2.0, arXiv:2404.04475) и эвристический "
-            "length-filtered win rate (фильтр по длине ответа)."
+            "Also compute length-controlled win rate (GLM in the spirit of "
+            "AlpacaEval 2.0, arXiv:2404.04475) and heuristic "
+            "length-filtered win rate (filter by response length)."
         ),
     )
     parser.add_argument(
         "--device",
         type=str,
         default=None,
-        help="Устройство (cuda/cpu). По умолчанию cuda при наличии.",
+        help="Device (cuda/cpu). Default: cuda if available.",
     )
     parser.add_argument(
         "--alpaca-eval-lib",
         action="store_true",
-        help="Оценка через официальную библиотеку alpaca_eval (GPT-4 аннотатор, нужен OPENAI_API_KEY). Без этого флага используется локальный судья Qwen2.5-14B.",
+        help="Evaluate via official alpaca_eval (GPT-4 annotator, needs OPENAI_API_KEY). Without this flag, use local Qwen2.5-14B judge.",
     )
     parser.add_argument(
         "--alpaca2",
         action="store_true",
-        help="AlpacaEval 2.0: официальный формат данных, reference — GPT-4-turbo (alpaca_eval_gpt4_baseline.json). Сравнение: ваша модель vs GPT-4-turbo. Всегда считаются win rate и length-controlled win rate.",
+        help="AlpacaEval 2.0: official data format, reference GPT-4-turbo (alpaca_eval_gpt4_baseline.json). Your model vs GPT-4-turbo. Win rate and length-controlled win rate are always computed.",
     )
     parser.add_argument(
         "--no-randomize-judge-order",
         action="store_true",
         help=(
-            "Не рандомизировать порядок (model_1/model_2) в промпте судьи. "
-            "По умолчанию рандомизация включена для борьбы с position bias."
+            "Do not randomize (model_1/model_2) order in the judge prompt. "
+            "By default randomization is on to reduce position bias."
         ),
     )
     parser.add_argument(
         "--judge-seed",
         type=int,
         default=0,
-        help="Seed для рандомизации порядка ответов судьи (по умолчанию 0).",
+        help="Seed for randomizing answer order in the judge prompt (default 0).",
     )
     args = parser.parse_args()
 
     if args.base_only and args.checkpoint:
-        parser.error("Нельзя указывать одновременно --checkpoint и --base-only. Уберите один из параметров.")
+        parser.error("Cannot use --checkpoint and --base-only together. Remove one of them.")
     if not args.base_only and not args.checkpoint:
-        parser.error("Укажите --checkpoint или используйте --base-only для оценки базовой модели.")
+        parser.error("Pass --checkpoint or use --base-only to evaluate the base model.")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     base_model_id = BASE_MODEL_CHOICES[args.base_model]
@@ -1025,9 +1024,10 @@ def main():
     def log_run_footer(status: str = "SUCCESS") -> None:
         run_finished_at = datetime.now()
         run_duration_sec = perf_counter() - run_started_perf
+        run_duration_hours = run_duration_sec / 3600.0
         log(f"Run finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
         log(f"Run status: {status}")
-        log(f"Run duration: {run_duration_sec:.1f}s")
+        log(f"Run duration: {run_duration_hours:.2f}h")
 
     baseline_name = "GPT-4-turbo (reference)" if args.alpaca2 else "text_davinci_003"
     log("=== AlpacaEval (Qwen2.5-14B-Instruct judge) ===")
@@ -1037,7 +1037,7 @@ def main():
     log(f"Data: {args.data or (ALPACA_EVAL_V2_REFERENCE_URL if args.alpaca2 else ALPACA_EVAL_DATA_URL)}")
     log(f"Device: {device}")
 
-    # 1) Загрузка данных
+    # 1) Load data
     if args.alpaca2:
         eval_data = load_alpaca_eval_v2_data(args.data if args.data and os.path.isdir(args.data) else None)
     else:
@@ -1048,7 +1048,7 @@ def main():
     n = len(eval_data)
     log(f"Examples: {n} (total in data: {n_total})")
 
-    # 2) Загрузка модели-кандидата и генерация
+    # 2) Load candidate model and generate
     if args.base_only:
         log(f"Loading base model (no LoRA): {base_model_id}...")
         cand_tokenizer, cand_model, _ = load_base_model(base_model=base_model_id, device=device)
@@ -1068,12 +1068,12 @@ def main():
         batch_size=args.batch_size,
         do_sample=args.do_sample,
     )
-    # Освобождаем память от модели-кандидата перед загрузкой судьи
+    # Free candidate model memory before loading the judge
     del cand_model
     if is_cuda_device(device):
         torch.cuda.empty_cache()
 
-    # Сохраняем ответы кандидата (формат alpaca_eval: instruction, output, dataset, generator)
+    # Save candidate outputs (alpaca_eval format: instruction, output, dataset, generator)
     model_outputs_for_lib = [
         {
             "instruction": d["instruction"],
@@ -1097,7 +1097,7 @@ def main():
     log(f"Saved candidate outputs to {out_json}")
 
     if args.alpaca_eval_lib:
-        # Оценка через официальную библиотеку alpaca_eval (GPT-4 и т.д.)
+        # Evaluation via official alpaca_eval (GPT-4, etc.)
         _run_official_alpaca_eval(
             eval_data=eval_data,
             model_outputs_for_lib=model_outputs_for_lib,
@@ -1109,7 +1109,7 @@ def main():
         log_run_footer()
         return
 
-    # 3) Загрузка судьи и оценка (локальный Qwen2.5-14B)
+    # 3) Load judge and evaluate (local Qwen2.5-14B)
     log("Loading judge model (Qwen2.5-14B-Instruct)...")
     judge_tokenizer, judge_model, _ = load_judge_model(device=device)
     randomize = not args.no_randomize_judge_order
@@ -1178,7 +1178,7 @@ def main():
         results_dict["length_filtered_win_rate"] = lc_filtered
     with open(os.path.join(out_dir, "judge_results.json"), "w", encoding="utf-8") as f:
         json.dump(results_dict, f, indent=2)
-    # Сохраняем примеры для разбора: инструкция, ответы, вердикт судьи
+    # Save examples for inspection: instruction, outputs, judge verdict
     examples_path = os.path.join(out_dir, "judge_examples.json")
     with open(examples_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

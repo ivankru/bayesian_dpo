@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Google IFEval (Instruction Following Eval): верифицируемая метрика следования
-инструкциям без LLM-судьи — только правила из официального бенчмарка.
+Google IFEval (Instruction Following Eval): verifiable instruction-following metric
+without an LLM judge — only rules from the official benchmark.
 
-Источник кода и данных (Apache-2.0):
+Source code and data (Apache-2.0):
   https://github.com/google-research/google-research/tree/master/instruction_following_eval
 
-Способ поставки: при первом запуске скачиваются нужные .py и input_data.jsonl в
+Delivery: on first run, required .py files and input_data.jsonl are downloaded to
   ~/.cache/soft_dpo/ifeval/
-(ветка master с raw.githubusercontent.com; для воспроизводимости можно зафиксировать
-коммит в IFEVAL_GITHUB_REV ниже).
+(master branch from raw.githubusercontent.com; pin a full google-research commit in
+IFEVAL_GITHUB_REV below for reproducibility).
 
-Зависимости оценки (как в официальном requirements.txt того каталога): см. комментарии
-в requirements.py (absl-py, langdetect, nltk, immutabledict).
+Eval dependencies (as in that directory's official requirements.txt): see comments in
+requirements.py (absl-py, langdetect, nltk, immutabledict).
 
-Примеры:
-  # База 7B, без LoRA
+Examples:
+  # Base 7B, no LoRA
   python ifeval_run.py --base-only --base-model 7b --output ifeval2/base_7b
 
-  # Чекпоинт UltraFeedback soft-DPO + LoRA (база 7B); по умолчанию артефакты в <checkpoint>/ifeval/
+  # UltraFeedback soft-DPO + LoRA checkpoint (7B base); artifacts default to <checkpoint>/ifeval/
   python ifeval_run.py -c checkpoints/ultrafb/soft_ultrafb_lr4e5_beta01/best \\
       --base-model 7b -o ifeval2/soft_ultrafb_lr4e5_beta01
 """
@@ -49,7 +49,7 @@ from alpaca_eval_judge import (
     load_candidate_model,
 )
 
-# Пин ревизии (подставьте полный SHA коммита google-research для полной фиксации).
+# Pin revision (set full google-research commit SHA for a fully pinned checkout).
 IFEVAL_GITHUB_REV = "master"
 IFEVAL_REPO_PREFIX = (
     f"https://raw.githubusercontent.com/google-research/google-research/"
@@ -73,17 +73,17 @@ def _download(url: str, dest: Path) -> None:
         with urllib.request.urlopen(url, timeout=120) as resp:
             data = resp.read()
     except urllib.error.URLError as e:
-        raise RuntimeError(f"Не удалось скачать {url}: {e}") from e
+        raise RuntimeError(f"Failed to download {url}: {e}") from e
     dest.write_bytes(data)
 
 
 def ensure_ifeval_sources(cache_root: Optional[Path] = None) -> Tuple[Path, Path]:
     """
-    Кладёт пакет instruction_following_eval и данные в cache_root.
-    Возвращает (pkg_parent, path_to_input_jsonl), где pkg_parent нужно добавить в sys.path.
+    Places the instruction_following_eval package and data under cache_root.
+    Returns (pkg_parent, path_to_input_jsonl); add pkg_parent to sys.path.
 
-    Маркер `.ifeval_sources_ok` хранит IFEVAL_REPO_PREFIX, чтобы при смене ревизии
-    (IFEVAL_GITHUB_REV) кэш автоматически инвалидировался и файлы перекачивались.
+    Marker `.ifeval_sources_ok` stores IFEVAL_REPO_PREFIX so that when the revision
+    (IFEVAL_GITHUB_REV) changes, the cache is invalidated and files are re-downloaded.
     """
     root = (cache_root or DEFAULT_CACHE_ROOT).resolve()
     pkg_parent = root / "pkg"
@@ -119,8 +119,8 @@ def ensure_ifeval_sources(cache_root: Optional[Path] = None) -> Tuple[Path, Path
 
 def _ensure_nltk(cache_root: Optional[Path] = None) -> None:
     """
-    Гарантирует наличие токенизаторов NLTK (punkt_tab или punkt).
-    Если HOME read-only, скачиваем в cache_root/nltk_data и регистрируем в nltk.data.path.
+    Ensures NLTK tokenizers (punkt_tab or punkt) are available.
+    If HOME is read-only, download to cache_root/nltk_data and register in nltk.data.path.
     """
     import nltk
 
@@ -154,13 +154,13 @@ def _ensure_nltk(cache_root: Optional[Path] = None) -> None:
         except LookupError:
             pass
     raise RuntimeError(
-        "NLTK: не найдены tokenizers/punkt_tab или punkt. "
-        "Установите nltk и: python3 -c \"import nltk; nltk.download('punkt_tab')\""
+        "NLTK: tokenizers/punkt_tab or punkt not found. "
+        "Install nltk and run: python3 -c \"import nltk; nltk.download('punkt_tab')\""
     )
 
 
 def import_evaluation_lib(pkg_parent: Path, cache_root: Optional[Path] = None):
-    """Импорт официального evaluation_lib после добавления пути."""
+    """Import official evaluation_lib after adding pkg_parent to the path."""
     parent = str(pkg_parent.resolve())
     if parent not in sys.path:
         sys.path.insert(0, parent)
@@ -178,8 +178,8 @@ def import_evaluation_lib(pkg_parent: Path, cache_root: Optional[Path] = None):
         from instruction_following_eval import evaluation_lib  # noqa: WPS433
     except ImportError as e:
         raise ImportError(
-            "Для IFEval нужны зависимости из официального instruction_following_eval/requirements.txt. "
-            "Установите: python3 -m pip install absl-py langdetect nltk immutabledict"
+            "IFEval requires dependencies from official instruction_following_eval/requirements.txt. "
+            "Install: python3 -m pip install absl-py langdetect nltk immutabledict"
         ) from e
 
     return evaluation_lib
@@ -199,7 +199,7 @@ def load_ifeval_inputs_simple(
 
 
 def aggregate_metrics(outputs) -> Dict[str, Any]:
-    """Те же величины, что print_report в evaluation_lib (prompt / instruction level + по типам)."""
+    """Same aggregates as print_report in evaluation_lib (prompt / instruction level + by type)."""
     prompt_total = 0
     prompt_correct = 0
     instruction_total = 0
@@ -253,82 +253,82 @@ def main() -> None:
         "-c",
         type=str,
         default=None,
-        help="Чекпоинт (LoRA или полная модель). Не используется с --base-only.",
+        help="Checkpoint (LoRA or full model). Not used with --base-only.",
     )
     parser.add_argument(
         "--base-only",
         action="store_true",
-        help="Оценить только базовую модель без LoRA.",
+        help="Evaluate base model only without LoRA.",
     )
     parser.add_argument(
         "--base-model",
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="База для кандидата: 3b или 7b (Qwen2.5-Instruct).",
+        help="Base model for candidate: 3b or 7b (Qwen2.5-Instruct).",
     )
     parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="Каталог артефактов (по умолчанию ifeval2/base_* или <checkpoint>/ifeval).",
+        help="Artifact directory (default: ifeval2/base_* or <checkpoint>/ifeval).",
     )
     parser.add_argument(
         "--data",
         "-d",
         type=str,
         default=None,
-        help="Локальный input_data.jsonl IFEval; иначе из кэша ~/.cache/soft_dpo/ifeval/.",
+        help="Local IFEval input_data.jsonl; otherwise from cache ~/.cache/soft_dpo/ifeval/.",
     )
     parser.add_argument(
         "--cache-dir",
         type=str,
         default=None,
-        help="Корень кэша IFEval (по умолчанию ~/.cache/soft_dpo/ifeval).",
+        help="IFEval cache root (default: ~/.cache/soft_dpo/ifeval).",
     )
     parser.add_argument(
         "--max-evals",
         type=int,
         default=None,
-        help="Ограничение числа промптов (отладка).",
+        help="Max number of prompts (debugging).",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=2048,
-        help="Макс. новых токенов (IFEval часто требует длинные ответы).",
+        help="Max new tokens (IFEval often needs long completions).",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
-        help="Батч генерации.",
+        help="Generation batch size.",
     )
     parser.add_argument(
         "--do-sample",
         action="store_true",
-        help="Сэмплирование (temperature 0.6 как в alpaca_eval_judge).",
+        help="Sampling (temperature 0.6 as in alpaca_eval_judge).",
     )
     parser.add_argument(
         "--device",
         type=str,
         default=None,
-        help="cuda / cpu (по умолчанию cuda при наличии).",
+        help="cuda / cpu (default: cuda if available).",
     )
     parser.add_argument(
         "--skip-loose",
         action="store_true",
-        help="Не считать loose-метрики (верхняя оценка с ослабленными проверками).",
+        help="Skip loose metrics (upper bound with relaxed checks).",
     )
     parser.add_argument(
         "--no-system-prompt",
         action="store_true",
         help=(
-            "Не добавлять system='You are a helpful assistant.' в chat-template. "
-            "Полезно для IFEval: с дефолтным system-сообщением модели иногда добавляют "
-            "преамбулу ('Sure! Here's...'), которая ломает позиционные констрейнты "
-            "(first_word, startswith, response_language и т.п.)."
+            "Do not add system='You are a helpful assistant.' to the chat template. "
+            "Useful for IFEval: with the default system message, models sometimes add "
+            "a preamble ('Sure! Here's...') that breaks positional constraints "
+            "(first_word, startswith, response_language, etc.)."
         ),
     )
     parser.add_argument(
@@ -336,15 +336,15 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Кастомный system-prompt (переопределяет дефолтный). Игнорируется при --no-system-prompt."
+            "Custom system prompt (overrides default). Ignored with --no-system-prompt."
         ),
     )
     args = parser.parse_args()
 
     if args.base_only and args.checkpoint:
-        parser.error("Нельзя одновременно --checkpoint и --base-only.")
+        parser.error("Cannot use --checkpoint and --base-only together.")
     if not args.base_only and not args.checkpoint:
-        parser.error("Укажите --checkpoint или --base-only.")
+        parser.error("Provide --checkpoint or --base-only.")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     base_model_id = BASE_MODEL_CHOICES[args.base_model]
@@ -353,7 +353,7 @@ def main() -> None:
     pkg_parent, default_data = ensure_ifeval_sources(cache_root)
     data_path = args.data or str(default_data)
     if not os.path.isfile(data_path):
-        raise FileNotFoundError(f"Нет файла данных IFEval: {data_path}")
+        raise FileNotFoundError(f"IFEval data file not found: {data_path}")
 
     out_dir = args.output or default_output_dir(
         args.base_only, args.base_model, args.checkpoint
@@ -498,9 +498,10 @@ def main() -> None:
     log(f"Done. Artifacts in {out_dir}")
     run_finished_at = datetime.now()
     run_duration_sec = perf_counter() - run_started_perf
+    run_duration_hours = run_duration_sec / 3600.0
     log(f"Run finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
     log("Run status: SUCCESS")
-    log(f"Run duration: {run_duration_sec:.1f}s")
+    log(f"Run duration: {run_duration_hours:.2f}h")
 
 
 if __name__ == "__main__":

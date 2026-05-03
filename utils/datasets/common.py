@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Общие хелперы для работы с датасетами DPO."""
+"""Shared helpers for DPO datasets."""
 import math
 from typing import Any, Callable, Dict, List
 
@@ -11,7 +11,7 @@ from utils.loss import _logps
 
 
 def sigmoid(x: float) -> float:
-    """Стабильный sigmoid: 1 / (1 + exp(-x))."""
+    """Numerically stable sigmoid: 1 / (1 + exp(-x))."""
     if x >= 0:
         return 1.0 / (1.0 + math.exp(-x))
     ex = math.exp(x)
@@ -19,7 +19,7 @@ def sigmoid(x: float) -> float:
 
 
 def ultrafeedback_message_to_response(messages: List[Dict[str, str]]) -> str:
-    """Из списка сообщений {role, content} достаёт конкатенацию ответов assistant."""
+    """Concatenate assistant replies from a list of {role, content} messages."""
     parts = [m["content"] for m in messages if m.get("role") == "assistant"]
     return "\n".join(parts).strip() if parts else ""
 
@@ -37,8 +37,8 @@ def _precompute_p_pred_column(
     column_name: str,
 ) -> Dataset:
     """
-    Один проход по train_ds: p = sigmoid(beta * diff), diff как в soft_dpo_loss;
-    записывает столбец column_name. Политика и ref — в torch.no_grad().
+    One pass over train_ds: p = sigmoid(beta * diff), diff as in soft_dpo_loss;
+    writes column_name. Policy and ref under torch.no_grad().
     """
     loader = DataLoader(
         train_ds,
@@ -94,9 +94,9 @@ def precompute_p_pred_cached(
     collate_fn: Callable[..., Any],
 ) -> Dataset:
     """
-    Один проход по train_ds (порядок строк датасета): считаете
-    p_pred = sigmoid(beta * ((logp1-logp2) - (logp1_ref-logp2_ref))) как в soft_dpo_loss,
-    записывает столбец p_pred_cached. Политика и ref — в torch.no_grad().
+    One pass over train_ds (row order preserved): compute
+    p_pred = sigmoid(beta * ((logp1-logp2) - (logp1_ref-logp2_ref))) as in soft_dpo_loss,
+    add column p_pred_cached. Policy and ref under torch.no_grad().
     """
     return _precompute_p_pred_column(
         train_ds,
@@ -124,8 +124,8 @@ def precompute_p_pred_teacher(
     collate_fn: Callable[..., Any],
 ) -> Dataset:
     """
-    Заморозка «учителя» после warmup-эпох: те же σ(beta*diff), что и для p_pred_cached,
-    но в отдельный столбец p_pred_teacher (не перезаписывается в фазе смешивания).
+    Freeze teacher after warmup epochs: same σ(beta*diff) as p_pred_cached,
+    stored in column p_pred_teacher (not overwritten during blending).
     """
     return _precompute_p_pred_column(
         train_ds,

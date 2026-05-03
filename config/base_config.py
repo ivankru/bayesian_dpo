@@ -1,45 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-Базовые константы обучения и валидации, которые редко меняют от эксперимента к эксперименту.
+Base training and validation constants that rarely change from experiment to experiment.
 
-Часто тюнятые гиперпараметры (lr, beta, batch_size, epochs, λ, датасет) остаются в CLI;
-здесь — лимиты токенов, chat template, якорная температура p_pred, val entropy и capability retention.
+Frequently tuned hyperparameters (lr, beta, batch_size, epochs, λ, dataset) stay in the CLI;
+here: token limits, chat template, anchor temperature p_pred, val entropy, and capability retention.
 """
 
-# Лимиты длины (prompt и prompt+response); при нехватке VRAM уменьшать здесь.
-MAX_PROMPT_LEN = 768  # можно поднять до 1024, если хватает памяти
+# Length limits (prompt and prompt+response); reduce here if VRAM is tight.
+MAX_PROMPT_LEN = 768  # can raise to 1024 if memory allows
 MAX_FULL_LEN = 1536  # prompt+response
 
-# Qwen-Instruct: log p через apply_chat_template (единый дефолт для всех датасетов).
+# Qwen-Instruct: log p via apply_chat_template (single default for all datasets).
 USE_CHAT_TEMPLATE = True
 
-# T>0 для σ((beta*diff)/T) в якорном режиме (lambda_full_epochs > 0); см. utils.loss.soft_dpo_loss.
+# T>0 for σ((beta*diff)/T) in anchor mode (lambda_full_epochs > 0); see utils.loss.soft_dpo_loss.
 P_PRED_TARGET_TEMPERATURE = 2.0
 
-# Val response entropy: первые N промптов; 0 — отключить метрику.
+# Val response entropy: first N prompts; 0 disables the metric.
 VAL_ENTROPY_MAX_PROMPTS = 512
-# Val KL-MC: независимых генераций на промпт для MC-оценки KL(policy||ref).
+# Val KL-MC: independent generations per prompt for MC estimate of KL(policy||ref).
 VAL_KL_MC_NUM_SAMPLES = 8
-# Промптов за один generate при MC-оценке KL(policy||ref).
+# Prompts per generate call in MC KL(policy||ref) estimation.
 VAL_KL_MC_PROMPT_BATCH_SIZE = 6
-# Промптов за один generate; микробатч полного forward (VRAM).
+# Prompts per generate; microbatch for full forward (VRAM).
 VAL_ENTROPY_PROMPT_BATCH_SIZE = 4
 VAL_ENTROPY_FORWARD_CHUNK_SIZE = 2
-# Независимых генераций на промпт; L — первые токены ответа для оценки энтропии.
+# Independent generations per prompt; L — first response tokens for entropy estimate.
 VAL_ENTROPY_NUM_SAMPLES = 8
 VAL_ENTROPY_MAX_NEW_TOKENS = 128
 
-# Capability retention (eval_datasets): limit=None — без обрезки числа примеров.
+# Capability retention (eval_datasets): limit=None — no cap on number of examples.
 CAPABILITY_EVAL_LIMIT = None
 CAPABILITY_EVAL_MAX_NEW_TOKENS = 256
 CAPABILITY_EVAL_BATCH_SIZE = 2
 CAPABILITY_EVAL_MAX_PROMPT_TOKENS = 2048
 
-# Интервал (в глобальных шагах train) вывода средней train loss с её разбивкой
-# по компонентам (soft/hard/bayes): log_msg один раз в LOG_INTERVAL шагов.
-# Не влияет на метрики — чисто частота стрелок в train.log и stderr.
+# Interval (in global train steps) for logging mean train loss and its breakdown
+# by component (soft/hard/bayes): log_msg once every LOG_INTERVAL steps.
+# Does not affect metrics — only how often lines appear in train.log and stderr.
 LOG_INTERVAL = 100
-# Интервал (в шагах) вывода текущего lr и агрегатов расхождения p_target vs p_gt
-# (target_shift/gap_abs), полезный для отладки λ-расписания и teacher-anchor.
-# Шумит сильнее LOG_INTERVAL, поэтому держим реже.
+# Interval (in steps) for logging current lr and aggregates of p_target vs p_gt mismatch
+# (target_shift/gap_abs), useful for debugging λ schedule and teacher-anchor.
+# Noisier than LOG_INTERVAL, so keep it less frequent.
 LR_ALIGN_LOG_INTERVAL = 1000

@@ -2,8 +2,8 @@
 """
 Back-compat layer for loss functions.
 
-Новый код находится в `utils.losses.*`.
-Этот модуль оставлен для старых импортов:
+New implementations live in `utils.losses.*`.
+This module remains for legacy imports:
   from utils.loss import hard_dpo_loss, soft_dpo_loss, soft_dpo_loss_alt
 """
 
@@ -44,12 +44,12 @@ __all__ = [
 ]
 # -*- coding: utf-8 -*-
 """
-DPO loss: hard (chosen/rejected) и soft (resp1, resp2, p / p_bayes).
-Все функции возвращают (loss, kl_approx).
+DPO loss: hard (chosen/rejected) and soft (resp1, resp2, p / p_bayes).
+All functions return (loss, kl_approx).
 
-kl_approx: это не истинная KL-дивергенция KL(π||ref), а среднее по батчу 0.5*(mean(log π - log ref)_1 + mean(log π - log ref)_2).
-Считается по фиксированным ответам в батче, поэтому может быть отрицательным (π даёт меньшую массу
-этим ответам, чем ref) или очень большим при сильном дрифте — это ожидаемо.
+kl_approx: not true KL(π||ref); batch mean 0.5*(mean(log π - log ref)_1 + mean(log π - log ref)_2).
+Computed on fixed responses in the batch, so it can be negative (π assigns less mass
+to those responses than ref) or very large under strong drift — expected.
 """
 import torch
 import torch.nn.functional as F
@@ -125,8 +125,8 @@ def hard_dpo_loss(
     **kwargs,
 ):
     """
-    Hard DPO: batch с полями prompt, chosen, rejected.
-    Возвращает (loss, kl_approx).
+    Hard DPO: batch with fields prompt, chosen, rejected.
+    Returns (loss, kl_approx).
     """
     prompts = batch["prompt"]
     chosen = batch["chosen"]
@@ -140,7 +140,7 @@ def hard_dpo_loss(
 
     diff = (logp_c - logp_r) - (logp_c_ref - logp_r_ref)
     loss = -F.logsigmoid(beta * diff).mean()
-    # аппроксимация "средний log π/ref" по chosen и rejected (не истинная KL, может быть < 0)
+    # proxy "mean log π/ref" over chosen and rejected (not true KL, can be < 0)
     kl_approx = 0.5 * (
         (logp_c - logp_c_ref).mean().item() + (logp_r - logp_r_ref).mean().item()
     )
@@ -162,17 +162,17 @@ def soft_dpo_loss(
     **kwargs,
 ):
     """
-    Anchored Soft-DPO (формула (9) из ADPO):
+    Anchored Soft-DPO (ADPO eq. (9)):
     loss = softplus(beta * diff) - p_target * beta * diff,
-    где diff = (Δ_theta - Δ_ref).
+    where diff = (Δ_theta - Δ_ref).
     batch: prompt, resp1, resp2, p, p_bayes.
-    lambda_label in [0, 1]: при 1.0 цель — чистые метки p_gt; иначе смешивание с p_pred
-    (либо p_pred_cached до эпохи, либо якорный режим с p_pred_teacher — см. ниже).
-    p_pred_target_temperature (T): для p_pred_i = σ((beta*diff)/T) в якорном режиме; логит в softplus — beta*diff без T.
-    p_pred_teacher_blend (w ∈ [0,1]): при p_pred_teacher задаётся из цикла обучения — в якорном режиме w=0.5
-    на всех хвостовых шагах: p_pred = w*p_teacher + (1-w)*p_pred_i с p_pred_i = σ((beta*diff)/T).
+    lambda_label in [0, 1]: at 1.0 target is pure labels p_gt; else blend with p_pred
+    (either p_pred_cached for the epoch, or anchor mode with p_pred_teacher — see below).
+    p_pred_target_temperature (T): for p_pred_i = σ((beta*diff)/T) in anchor mode; softplus logit stays beta*diff without T.
+    p_pred_teacher_blend (w ∈ [0,1]): when p_pred_teacher is supplied from the training loop — anchor mode uses w=0.5
+    on all tail steps: p_pred = w*p_teacher + (1-w)*p_pred_i with p_pred_i = σ((beta*diff)/T).
 
-    Возвращает (loss, kl_approx, diag): diag — dict с numpy 1d для логов align (target_shift; gap_abs если есть p_pred).
+    Returns (loss, kl_approx, diag): diag is a dict of numpy 1d for align logs (target_shift; gap_abs when p_pred exists).
     """
     if not 0.0 <= lambda_label <= 1.0:
         raise ValueError(f"lambda_label must be in [0, 1], got {lambda_label!r}")
@@ -187,12 +187,12 @@ def soft_dpo_loss(
     logp_1 = _logps(policy_model, tokenizer, prompts, resp1, device, use_chat_template)
     logp_2 = _logps(policy_model, tokenizer, prompts, resp2, device, use_chat_template)
 
-    # log π_ref (без градиента)
+    # log π_ref (no grad)
     with torch.no_grad():
         logp_1_ref = _logps(ref_model, tokenizer, prompts, resp1, device, use_chat_template)
         logp_2_ref = _logps(ref_model, tokenizer, prompts, resp2, device, use_chat_template)
 
-    # Δ_theta - Δ_ref (здесь порядок как в статье:
+    # Δ_theta - Δ_ref (ordering as in the paper:
     # Δ = (logπ1 - logπ2) - (logπ1_ref - logπ2_ref))
     delta_theta = logp_1 - logp_2
     delta_ref = logp_1_ref - logp_2_ref
@@ -206,25 +206,25 @@ def soft_dpo_loss(
         p_gt_m = p_gt.to(dtype=logit.dtype)
         lam = logit.new_tensor(lambda_label)
         if "p_pred_teacher" in batch:
-            # Якорный учитель: зафиксированные на warmup-эпохе вероятности p_pred_teacher
-            # (σ(beta*diff) без температуры, как в precompute_p_pred_teacher).
+            # Anchor teacher: probabilities p_pred_teacher fixed during warmup epochs
+            # (σ(beta*diff) without temperature, as in precompute_p_pred_teacher).
             p_teacher = torch.as_tensor(
                 batch["p_pred_teacher"], device=device, dtype=logit.dtype
             )
-            # Текущее «мягкое» предсказание из тех же логитов, что и в лоссе, но только для цели p_target:
+            # Current soft prediction from the same logits as the loss, but only for p_target:
             #   p_pred_i = σ((beta * diff) / T).
-            # Важно: аргумент softplus и член p_target * logit по-прежнему используют logit = beta*diff
-            # без T — меняется только смешиваемая в p_target вероятность, не кривизна DPO-потенциала.
+            # Important: softplus argument and p_target * logit still use logit = beta*diff
+            # without T — only the blended probability in p_target changes, not DPO potential curvature.
             #
-            # Эквивалентная интерпретация масштаба: σ((β·diff)/T) = σ((β/T)·diff), то есть для *этой*
-            # вероятности повышение T эквивалентно уменьшению эффективного коэффициента при том же diff:
-            # при T=2 то же самое, что σ((β/2)·diff). Именно поэтому T>1 размягчает крайние p_pred_i
-            # (ближе к 0.5), снижая шум от малых колебаний diff, не трогая β в основном логите.
+            # Equivalent scaling: σ((β·diff)/T) = σ((β/T)·diff), so for this probability
+            # raising T is like shrinking the effective coefficient at the same diff:
+            # T=2 matches σ((β/2)·diff). Hence T>1 softens extreme p_pred_i
+            # (toward 0.5), damping noise from small diff swings without changing β in the main logit.
             #
-            # Обязательно .detach(): p_pred_i — это *цель* в BCE-подобном члене softplus(logit) − p_target·logit,
-            # она должна играть роль фиксированной метки (как p_gt, p_teacher, p_pred_cached). Если оставить
-            # градиент — к производной добавится член −(1−λ)(1−w)·∂p_pred_i/∂θ · β·diff, и это меняет
-            # кривизну DPO-потенциала (не ADPO-формула (9) и не то, что обещает docstring).
+            # Must .detach(): p_pred_i is the *target* in the BCE-like term softplus(logit) − p_target·logit,
+            # it should act as a fixed label (like p_gt, p_teacher, p_pred_cached). If gradients flow,
+            # the derivative picks up −(1−λ)(1−w)·∂p_pred_i/∂θ · β·diff, which changes
+            # DPO curvature (not ADPO eq. (9) nor the docstring contract).
             T = float(p_pred_target_temperature)
             if T <= 0:
                 raise ValueError(
@@ -234,7 +234,7 @@ def soft_dpo_loss(
             w = float(p_pred_teacher_blend)
             if not 0.0 <= w <= 1.0:
                 raise ValueError(f"p_pred_teacher_blend must be in [0, 1], got {p_pred_teacher_blend!r}")
-            # w=0.5 (якорный режим из train_dpo): половина p_teacher, половина p_pred_i = σ((beta*diff)/T).
+            # w=0.5 (anchor mode from train_dpo): half p_teacher, half p_pred_i = σ((beta*diff)/T).
             p_pred = w * p_teacher + (1.0 - w) * p_pred_i
         else:
             p_pred = torch.as_tensor(
@@ -242,12 +242,12 @@ def soft_dpo_loss(
             )
         p_target = lam * p_gt_m + (1.0 - lam) * p_pred
 
-    # Формула (9): softplus - q * logit
-    # softplus(x) = log(1 + exp(x)) — устойчивый примитив
+    # Eq. (9): softplus - q * logit
+    # softplus(x) = log(1 + exp(x)) — numerically stable primitive
     loss_per_example = F.softplus(logit) - p_target * logit
     loss = loss_per_example.mean()
 
-    # тот же kl_approx, что был у тебя
+    # same kl_approx as before
     kl_approx = 0.5 * (
         (logp_1 - logp_1_ref).mean().item()
         + (logp_2 - logp_2_ref).mean().item()
@@ -256,9 +256,9 @@ def soft_dpo_loss(
     with torch.no_grad():
         ts = (p_target.detach() - p_gt.detach()).abs().float().cpu().numpy()
         diag: dict = {"target_shift": ts}
-        # gap_abs — чистая диагностика |p_gt - p_pred_*| (teacher или cached),
-        # не зависит от lambda_label. Информативна и при λ=1 (warmup-эпохи после
-        # фиксации teacher): показывает, насколько «учитель» расходится с метками.
+        # gap_abs — pure diagnostic |p_gt - p_pred_*| (teacher or cached),
+        # independent of lambda_label. Useful even at λ=1 (warmup epochs after
+        # teacher fix): shows how far the teacher drifts from labels.
         if "p_pred_teacher" in batch:
             pp = torch.as_tensor(
                 batch["p_pred_teacher"], dtype=torch.float32, device=device
@@ -291,11 +291,11 @@ def soft_dpo_loss_alt(
     **kwargs,
 ):
     """
-    Альтернативный Soft-DPO в масштабе old_loss / beta.
-    При beta >= approx_beta_threshold считает точно:
+    Alternative Soft-DPO scaled like old_loss / beta.
+    For beta >= approx_beta_threshold compute exactly:
       loss = [softplus(beta*diff) - p_target*beta*diff] / beta
-    При beta < approx_beta_threshold использует стабильную аппроксимацию
-    для softplus(beta*diff)/beta с сокращенным beta.
+    For beta < approx_beta_threshold use a stable approximation
+    for softplus(beta*diff)/beta with reduced beta.
     """
     if not 0.0 <= lambda_label <= 1.0:
         raise ValueError(f"lambda_label must be in [0, 1], got {lambda_label!r}")
@@ -393,9 +393,9 @@ def soft_dpo_loss_alt_centered(
     **kwargs,
 ):
     """
-    Альтернативный Soft-DPO в масштабе old_loss / beta с центрированным softplus:
+    Alternative Soft-DPO in old_loss / beta scale with centered softplus:
       loss = [softplus(beta*diff) - ln(2)] / beta - p_target*diff
-    Центрирование вычитает константу ln(2)/beta и не меняет минимум по параметрам.
+    Centering subtracts ln(2)/beta and does not change parameter minima.
     """
     if not 0.0 <= lambda_label <= 1.0:
         raise ValueError(f"lambda_label must be in [0, 1], got {lambda_label!r}")

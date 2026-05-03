@@ -54,46 +54,46 @@ def main(
     optimizer_name: str = "AdamW",
 ):
     """
-    resume_from: путь к чекпоинту (например "checkpoints/hard_dpo_steer/best").
-    Если задан, policy и tokenizer загружаются из чекпоинта, обучение продолжается с этих весов.
-    seed: для воспроизводимости; одинаковый seed в hard_dpo_steer и soft_steer даёт совпадающие начальные метрики на val.
-    output_dir: папка для чекпоинтов и train.log.
+    resume_from: checkpoint path (e.g. "checkpoints/hard_dpo_steer/best").
+    If set, policy and tokenizer load from checkpoint and training continues from those weights.
+    seed: reproducibility; same seed in hard_dpo_steer and soft_steer matches initial val metrics.
+    output_dir: directory for checkpoints and train.log.
     dataset: "helpsteer3" | "ultrafeedback_binarized" | "hh_rlhf" (PKU processed HH-RLHF).
     base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507.
-    batch_size: размер батча для train и validation.
-    lambda_min: для режима hard не используется (оставлено для единообразия CLI с soft_dpo_steer).
-    use_chat_template: log p через apply_chat_template (дефолт в config.base_config).
-    capability_eval_dir: если задан — на каждой валидации eval_datasets (gold), см. train_dpo.
-    resume_start_epoch_1based: см. utils.training.train_dpo (--epochs = полный план, --start-epoch).
+    batch_size: batch size for train and validation.
+    lambda_min: unused in hard mode (kept for CLI parity with soft_dpo_steer).
+    use_chat_template: log p via apply_chat_template (default in config.base_config).
+    capability_eval_dir: if set, eval_datasets (gold) on each validation; see train_dpo.
+    resume_start_epoch_1based: see utils.training.train_dpo (--epochs = full plan, --start-epoch).
     """
     if dataset not in DATASET_CHOICES:
-        raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
+        raise ValueError(f"dataset must be one of {DATASET_CHOICES}, got: {dataset!r}")
     set_seed(seed)
     if dataset == "helpsteer3":
-        print("Загружаю HelpSteer3-Preference...")
+        print("Loading HelpSteer3-Preference...")
         train_ds, val_ds = build_dpo_datasets()
     elif dataset == "ultrafeedback_binarized":
-        print("Загружаю UltraFeedback Binarized...")
+        print("Loading UltraFeedback Binarized...")
         train_ds, val_ds = build_dpo_datasets_ultrafeedback()
     else:
-        print("Загружаю PKU processed HH-RLHF...")
+        print("Loading PKU processed HH-RLHF...")
         train_ds, val_ds = build_dpo_datasets_hh_rlhf()
     model_name = BASE_MODEL_CHOICES[base_model]
     print(f"Model: {model_name}, Dataset: {dataset}, train size: {len(train_ds)}, val size: {len(val_ds)}")
     if resume_from:
-        print(f"Загружаю модель из чекпоинта: {resume_from} (база {model_name})")
+        print(f"Loading model from checkpoint: {resume_from} (base {model_name})")
     else:
-        print(f"Загружаю модель и токенайзер: {model_name} (LoRA)")
+        print(f"Loading model and tokenizer: {model_name} (LoRA)")
     tokenizer, policy_model, ref_model, device = load_models_and_tokenizer(
         model_name, use_lora=True, lora_r=16, lora_alpha=32, resume_from=resume_from
     )
 
     def log_fn(msg: str) -> None:
-        # Лог-строки идут в stdout, чтобы не смешиваться с tqdm-прогрессами (stderr).
-        # Это даёт чистое `>run.log` с только осмысленными строками.
+        # Log lines go to stdout so they do not mix with tqdm (stderr).
+        # Keeps a clean `>run.log` with meaningful lines only.
         print(msg, flush=True, file=sys.stdout)
 
-    print("Начинаю обучение DPO (hard)...")
+    print("Starting DPO (hard) training...")
     train_dpo(
         train_ds,
         val_ds,
@@ -147,52 +147,52 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Hard DPO: HelpSteer3, UltraFeedback Binarized или HH-RLHF (PKU-Alignment/processed-hh-rlhf)."
+        description="Hard DPO: HelpSteer3, UltraFeedback Binarized, or HH-RLHF (PKU-Alignment/processed-hh-rlhf)."
     )
     parser.add_argument(
         "--resume", "-r",
         type=str,
         default=None,
-        help="Путь к чекпоинту для продолжения обучения (например checkpoints/hard_dpo_steer/best)",
+        help="Checkpoint path to resume from (e.g. checkpoints/hard_dpo_steer/best)",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Seed для воспроизводимости (по умолчанию 42)")
-    parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/hard_dpo_steer", help="Папка для чекпоинтов и train.log (для разных запусков задавайте разные папки)")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility (default 42)")
+    parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/hard_dpo_steer", help="Directory for checkpoints and train.log (use a new folder per run)")
     parser.add_argument(
         "--dataset",
         "-d",
         type=str,
         default="helpsteer3",
         choices=list(DATASET_CHOICES),
-        help="Датасет: helpsteer3, ultrafeedback_binarized или hh_rlhf (PKU-Alignment/processed-hh-rlhf).",
+        help="Dataset: helpsteer3, ultrafeedback_binarized, or hh_rlhf (PKU-Alignment/processed-hh-rlhf).",
     )
     parser.add_argument(
         "--base-model",
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="Базовая модель: 3b/7b — Qwen2.5-Instruct; 4b — Qwen3-4B-Instruct-2507. По умолчанию: 3b.",
+        help="Base model: 3b/7b — Qwen2.5-Instruct; 4b — Qwen3-4B-Instruct-2507. Default: 3b.",
     )
-    parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
-    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
+    parser.add_argument("--batch-size", "-b", type=int, default=8, help="Batch size for train and validation (default: 8).")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5).")
     parser.add_argument(
         "--optimizer",
         type=_optimizer_type,
         default="AdamW",
-        help="Оптимизатор policy (case-insensitive): AdamW (по умолчанию) или SGD.",
+        help="Policy optimizer (case-insensitive): AdamW (default) or SGD.",
     )
-    parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    parser.add_argument("--beta", type=float, default=0.2, help="DPO beta parameter (default: 0.2).")
     parser.add_argument(
         "--grad-clip-norm",
         type=float,
         default=0.0,
-        help="Max norm для clip_grad_norm_; 0 отключает клиппинг (по умолчанию: 0).",
+        help="Max norm for clip_grad_norm_; 0 disables clipping (default: 0).",
     )
     parser.add_argument(
         "--epochs",
         "-e",
         type=int,
         default=8,
-        help="Всего эпох в плане (LR по шкале 1..epochs). При --start-epoch>1 обучаются эпохи start..epochs.",
+        help="Total planned epochs (LR on scale 1..epochs). With --start-epoch>1, trains epochs start..epochs.",
     )
     parser.add_argument(
         "--start-epoch",
@@ -200,37 +200,37 @@ if __name__ == "__main__":
         default=1,
         metavar="N",
         help=(
-            "Первая эпоха запуска (1-based), <= --epochs; --resume после эпохи N-1. "
-            "Эпох в этом запуске: epochs - start + 1. "
-            "При --resume и N>1 в начало train.log в --output-dir переносится история "
-            "старого train.log (рядом с чекпоинтом) до эпохи N, если граница найдена в логе."
+            "First epoch of run (1-based), <= --epochs; --resume weights after epoch N-1. "
+            "Epochs in this run: epochs - start + 1. "
+            "With --resume and N>1, prior train.log (next to checkpoint) is prepended to train.log in --output-dir "
+            "through epoch N if a boundary is found in the log."
         ),
     )
     parser.add_argument(
         "--lambda-min",
         type=_lambda_min_type,
         default=1.0,
-        help="Для hard не влияет; единый флаг с soft_dpo_steer [0, 1] (по умолчанию: 1.0).",
+        help="No effect in hard mode; shared flag with soft_dpo_steer [0, 1] (default: 1.0).",
     )
     parser.add_argument(
         "--capability-eval-dir",
         type=str,
         default=None,
-        help="Каталог eval_datasets (knowledge/*.jsonl, reasoning/*.jsonl): на каждой валидации лог retention.",
+        help="eval_datasets directory (knowledge/*.jsonl, reasoning/*.jsonl): log retention on each validation.",
     )
     parser.add_argument(
         "--capability-ref-cache-path",
         type=str,
         default=None,
-        help="Явный путь к JSON-кэшу ref ответов для capability retention (опционально).",
+        help="Explicit path to JSON cache of ref answers for capability retention (optional).",
     )
     parser.add_argument(
         "--val-kl-mc-max-prompts",
         type=int,
         default=DEFAULT_VAL_KL_MC_MAX_PROMPTS,
         help=(
-            "MC-оценка forward KL(π‖ref) на val: первые N промптов; 0 — отключить "
-            f"(по умолчанию {DEFAULT_VAL_KL_MC_MAX_PROMPTS})."
+            "MC forward KL(π‖ref) on val: first N prompts; 0 disables "
+            f"(default {DEFAULT_VAL_KL_MC_MAX_PROMPTS})."
         ),
     )
     args = parser.parse_args()

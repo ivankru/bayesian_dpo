@@ -17,8 +17,8 @@ def hard_dpo_loss(
     **kwargs,
 ):
     """
-    Hard DPO: batch с полями prompt, chosen, rejected.
-    Возвращает (loss, kl_approx).
+    Hard DPO: batch with fields prompt, chosen, rejected.
+    Returns (loss, kl_approx).
     """
     prompts = batch["prompt"]
     chosen = batch["chosen"]
@@ -32,7 +32,7 @@ def hard_dpo_loss(
 
     diff = (logp_c - logp_r) - (logp_c_ref - logp_r_ref)
     loss = -F.logsigmoid(beta * diff).mean()
-    # аппроксимация "средний log π/ref" по chosen и rejected (не истинная KL, может быть < 0)
+    # Approximate mean log π/ref over chosen and rejected (not true KL; can be < 0)
     kl_approx = 0.5 * (
         (logp_c - logp_c_ref).mean().item() + (logp_r - logp_r_ref).mean().item()
     )

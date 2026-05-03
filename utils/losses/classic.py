@@ -20,9 +20,9 @@ def soft_dpo_classic_loss(
     **kwargs,
 ):
     """
-    Anchored Soft-DPO (формула (9) из ADPO):
+    Anchored Soft-DPO (formula (9) from ADPO):
     loss = softplus(beta * diff) - p_target * beta * diff,
-    где diff = (Δ_theta - Δ_ref).
+    where diff = (Δ_theta - Δ_ref).
     """
     return _compute_soft_loss_common(
         batch,

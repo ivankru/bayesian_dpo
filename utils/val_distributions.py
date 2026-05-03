@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Валидационные распределения логитов DPO: delta_theta, delta_ref, diff (margin).
+Validation distributions of DPO logits: delta_theta, delta_ref, diff (margin).
 """
 from typing import Dict, List, Optional
 
@@ -21,12 +21,12 @@ def compute_val_delta_distributions(
     max_batches: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    Для каждой пары (chosen, rejected) на val:
+    For each (chosen, rejected) pair on val:
       - delta_theta = logp_theta(chosen|x) - logp_theta(rejected|x)
       - delta_ref   = logp_ref(chosen|x)   - logp_ref(rejected|x)
-      - diff        = delta_theta - delta_ref  (margin DPO)
+      - diff        = delta_theta - delta_ref  (DPO margin)
 
-    Возвращает dict с тремя np.ndarray по всем собранным парам.
+    Returns a dict of three np.ndarray over all collected pairs.
     """
     policy_model.eval()
     ref_model.eval()

@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Загрузка модели, reference и токенайзера для DPO (soft/hard).
+Load policy, reference, and tokenizer for DPO (soft/hard).
 
-По умолчанию отдельная копия базовой модели под ref не загружается: роль ref играет
-тот же PeftModel с временно отключённым LoRA-адаптером (_PeftRefProxy). Это экономит
-~14 GB VRAM на 7B в bf16 (≈6 GB на 3B, ≈8 GB на 4B) и освобождает место под больший
-батч или отключение gradient checkpointing. Для кода, которому нужна «настоящая»
-отдельная PreTrainedModel (например, TRL DPOTrainer), передавайте share_ref_with_policy=False.
+By default no separate base copy is loaded for ref: ref is the same PeftModel with LoRA
+temporarily disabled (_PeftRefProxy). This saves ~14 GB VRAM on 7B bf16 (≈6 GB on 3B, ≈8 GB on 4B)
+and frees room for a larger batch or disabling gradient checkpointing. For code that needs a real
+standalone PreTrainedModel (e.g. TRL DPOTrainer), pass share_ref_with_policy=False.
 """
 import os
 from contextlib import contextmanager
@@ -18,17 +17,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.config import BASE_MODEL_3B
 
-# Пресеты target_modules для LoRA (Qwen2/Qwen3, подходит всем архитектурам с такими именами):
-#   "all" — все линейные проекции (Q/K/V/O + MLP: gate/up/down); дефолт. Это стандартный
-#           выбор в большинстве современных LoRA/QLoRA рецептов (в т.ч. TRL DPO). Даёт
-#           примерно в 2–3 раза больше trainable-параметров при том же rank, но они всё
-#           ещё < 1% базы; VRAM растёт в основном за счёт состояния AdamW (2× fp32 на
-#           trainable-параметр) — десятки MB против сотен GB активаций, пренебрежимо.
-#   "attn" — только Q/K/V/O (≈1/3 параметров трансформер-блока); минимум VRAM и шага,
-#           но LoRA влияет только на веса внимания, не на MLP (который держит большую
-#           часть «знания» модели). Это часто ограничивает выразительность адаптера
-#           для preference-alignment (особенно soft/Bayes-DPO с мягкими целями). Оставлен
-#           как опция для воспроизводимости со старыми прогонами.
+# LoRA target_modules presets (Qwen2/Qwen3; any arch with these module names):
+#   "all" — all linear projections (Q/K/V/O + MLP: gate/up/down); default. Standard
+#           choice in modern LoRA/QLoRA recipes (incl. TRL DPO). Yields ~2–3× more
+#           trainable params at the same rank, still < 1% of base; VRAM growth is mostly
+#           AdamW state (2× fp32 per trainable param) — tens of MB vs hundreds of GB activations, negligible.
+#   "attn" — Q/K/V/O only (~1/3 of block params); lowest VRAM per step,
+#           but LoRA touches attention only, not MLP (which holds most model
+#           "knowledge"). Often limits adapter expressiveness for preference alignment
+#           (especially soft/Bayes-DPO). Kept for reproducing older runs.
 _LORA_TARGETS_ATTN: List[str] = ["q_proj", "k_proj", "v_proj", "o_proj"]
 _LORA_TARGETS_ALL: List[str] = [
     "q_proj",
@@ -51,47 +48,45 @@ def _resolve_lora_target_modules(spec: LoraTargetSpec) -> List[str]:
         if key == "all":
             return list(_LORA_TARGETS_ALL)
         raise ValueError(
-            f"Неизвестный пресет lora_target_modules={spec!r}; ожидается 'attn', 'all' "
-            "или список имён модулей."
+            f"Unknown lora_target_modules preset={spec!r}; expected 'attn', 'all' "
+            "or a list of module names."
         )
     mods = [str(m).strip() for m in spec if str(m).strip()]
     if not mods:
-        raise ValueError("lora_target_modules: передан пустой список")
+        raise ValueError("lora_target_modules: empty list")
     return mods
 
 
 def resolve_peft_adapter_dir(resume_from: str) -> str:
     """
-    Путь к каталогу с PEFT-адаптером (adapter_config.json + веса).
+    Directory with PEFT adapter (adapter_config.json + weights).
 
-    Разрешён корень прогона (…/run_id) с подпапкой best/, как после train_dpo.
+    Run root (.../run_id) with best/ subdir is accepted, as after train_dpo.
     """
     p = os.path.abspath(os.path.expanduser(resume_from))
     if not os.path.isdir(p):
-        raise FileNotFoundError(f"Чекпоинт не найден (не каталог): {resume_from!r} -> {p}")
+        raise FileNotFoundError(f"Checkpoint not found (not a directory): {resume_from!r} -> {p}")
     if os.path.isfile(os.path.join(p, "adapter_config.json")):
         return p
     best = os.path.join(p, "best")
     if os.path.isfile(os.path.join(best, "adapter_config.json")):
         return best
     raise ValueError(
-        f"В {p!r} нет PEFT-адаптера: ожидается adapter_config.json в этой папке или в best/."
+        f"No PEFT adapter in {p!r}: expected adapter_config.json in this directory or in best/."
     )
 
 
 @contextmanager
 def _temporarily_disable_gradient_checkpointing(model):
-    """Если у model включён gradient checkpointing — выключает на время блока и
-    восстанавливает в finally. Иначе — no-op. Безопасно при отсутствии у model
-    методов *_disable/*_enable (тогда тоже no-op).
+    """If model has gradient checkpointing on, disable for the block and restore in finally.
+    Otherwise no-op. Safe if model lacks *_disable/*_enable (also no-op).
 
-    Зачем: ref-проход у `_PeftRefProxy` всегда идёт под `torch.no_grad()`. Если
-    у разделяемого с policy PeftModel включён gradient checkpointing, то
-    `torch.utils.checkpoint.checkpoint(...)` всё равно вызывается на каждом слое и
-    (а) бесполезно тратит время на recompute (backward не будет), (б) печатает
-    UserWarning «None of the inputs have requires_grad=True. Gradients will be None»,
-    потому что под no_grad хук `enable_input_require_grads` фактически no-op.
-    Временное отключение убирает оба эффекта без влияния на тренируемый policy-форвард.
+    Why: `_PeftRefProxy` ref forward always runs under `torch.no_grad()`. If the shared
+    PeftModel has gradient checkpointing enabled, `torch.utils.checkpoint.checkpoint(...)`
+    still runs per layer and (a) wastes time on recompute (no backward), (b) emits
+    UserWarning «None of the inputs have requires_grad=True. Gradients will be None»
+    because under no_grad `enable_input_require_grads` is effectively a no-op.
+    Temporarily disabling removes both without affecting the trainable policy forward.
     """
     is_on = bool(getattr(model, "is_gradient_checkpointing", False))
     if not is_on or not hasattr(model, "gradient_checkpointing_disable"):
@@ -107,41 +102,37 @@ def _temporarily_disable_gradient_checkpointing(model):
 
 class _PeftRefProxy:
     """
-    Прозрачный прокси для «ref модели» поверх PeftModel.
+    Transparent ref-model proxy over PeftModel.
 
-    Любой forward/generate временно отключает LoRA-адаптер через peft_model.disable_adapter(),
-    так что вызов эквивалентен forward по базовой модели без LoRA. Остальные атрибуты
-    (config, generation_config, eval/train и т.д.) делегируются напрямую в исходный PeftModel.
+    Any forward/generate temporarily disables LoRA via peft_model.disable_adapter(),
+    so the call matches base-model forward without LoRA. Other attributes
+    (config, generation_config, eval/train, etc.) delegate to the underlying PeftModel.
 
-    Это позволяет не держать вторую полную копию базовой модели в VRAM.
+    Avoids holding a second full base copy in VRAM.
 
-    Важные детали поведения:
-      - forward/generate всегда под no_grad не делаются автоматически; вызывающий код
-        сам отвечает за torch.no_grad() (как и раньше было с «настоящей» ref_model).
-      - На время вызова дополнительно отключается gradient checkpointing исходного
-        PeftModel (если был включён) — иначе ref-проход под no_grad крутит
-        torch.utils.checkpoint впустую (recompute без backward) и печатает
-        UserWarning про requires_grad=True. После выхода состояние checkpointing
-        восстанавливается, тренируемый policy-форвард не затрагивается.
-      - .generate() временно ставит config.use_cache=True, потому что policy_model.config.use_cache
-        установлен в False для обучения; без KV-cache генерация в разы медленнее.
-        (use_cache всё равно несовместим с gradient checkpointing, но мы и так его
-        отключаем — двойная страховка.)
-      - Прокси хранит только ссылку на peft_model — никаких дополнительных параметров
-        в памяти, поэтому экономия ~= размер базовой модели.
+    Behavior notes:
+      - forward/generate do not wrap no_grad automatically; callers must use
+        torch.no_grad() as with a real ref_model.
+      - Gradient checkpointing on the PeftModel is disabled for the call (if enabled)
+        — otherwise ref under no_grad still runs torch.utils.checkpoint (recompute without backward)
+        and warns about requires_grad. Checkpointing state is restored afterward; trainable policy forward unchanged.
+      - .generate() temporarily sets config.use_cache=True because policy_model.config.use_cache
+        is False for training; without KV-cache generation is much slower.
+        (use_cache conflicts with gradient checkpointing, but we disable checkpointing here — belt and suspenders.)
+      - Proxy only holds a reference to peft_model — no extra parameters, savings ~= one base model.
     """
 
     def __init__(self, peft_model) -> None:
         if not hasattr(peft_model, "disable_adapter"):
             raise TypeError(
-                "_PeftRefProxy ожидает PeftModel (с методом disable_adapter); "
-                f"получено {type(peft_model).__name__}"
+                "_PeftRefProxy expects PeftModel (with disable_adapter); "
+                f"got {type(peft_model).__name__}"
             )
         object.__setattr__(self, "_peft", peft_model)
 
     def __getattr__(self, name: str):
-        # __getattr__ вызывается только если стандартный lookup не нашёл атрибут:
-        # _peft хранится в __dict__, поэтому рекурсии нет.
+        # __getattr__ only if normal lookup misses the attribute:
+        # _peft lives in __dict__, so no recursion.
         return getattr(self._peft, name)
 
     def __setattr__(self, name: str, value) -> None:
@@ -183,33 +174,32 @@ def load_models_and_tokenizer(
     share_ref_with_policy: bool = True,
 ):
     """
-    Загружает tokenizer, policy (база + LoRA или из чекпоинта) и reference.
+    Load tokenizer, policy (base + LoRA or from checkpoint), and reference.
 
-    resume_from: путь к папке с adapter_config.json или к корню прогона с подпапкой best/.
-    Если задан, tokenizer и policy (LoRA) грузятся из разрешённого адаптера.
+    resume_from: directory with adapter_config.json or run root with best/ subdir.
+    If set, tokenizer and policy (LoRA) load from the resolved adapter.
 
-    lora_target_modules: какие модули обёртывать LoRA-адаптером (только при use_lora=True
-        и без resume_from — при resume target_modules берутся из сохранённого adapter_config.json):
-          - "all" (по умолчанию): Q/K/V/O + MLP (gate_proj, up_proj, down_proj) — стандартный
-                                 выбор современных LoRA/QLoRA-рецептов. MLP хранит большую часть
-                                 «знания» модели, и без него LoRA влияет только на паттерн внимания,
-                                 что в soft/Bayes-DPO часто недостаточно выразительно.
-          - "attn":              Q/K/V/O — старое поведение репозитория (минимум trainable params,
-                                 но ограниченная выразительность адаптера).
-          - список строк:        кастомный набор имён модулей (должны существовать в архитектуре).
-        Переключение влияет на число trainable-параметров (≈×2–3 при том же rank) и, соответственно,
-        на память AdamW-состояния; на пик VRAM активаций почти не влияет, т.к. LoRA-добавки малы
-        по сравнению с основным forward. ВАЖНО: смена пресета меняет семантику обучения, поэтому
-        эксперименты с разным lora_target_modules напрямую несравнимы.
+    lora_target_modules: modules to wrap with LoRA (only when use_lora=True
+        and resume_from is None — on resume, target_modules come from saved adapter_config.json):
+          - "all" (default): Q/K/V/O + MLP (gate_proj, up_proj, down_proj) — standard
+                             modern LoRA/QLoRA choice. MLP holds most model
+                             "knowledge"; without it LoRA only shifts attention patterns,
+                             often too weak for soft/Bayes-DPO.
+          - "attn":          Q/K/V/O — legacy repo behavior (fewest trainable params,
+                             limited adapter capacity).
+          - list of strings: custom module names (must exist in the architecture).
+        Switching changes trainable param count (~×2–3 at same rank) and AdamW state memory;
+        activation VRAM barely moves because LoRA deltas are tiny vs main forward. IMPORTANT: preset changes training semantics, so
+        runs with different lora_target_modules are not directly comparable.
 
     share_ref_with_policy:
-      - True (по умолчанию) и используется LoRA: отдельная базовая модель под ref
-        НЕ загружается; возвращается _PeftRefProxy поверх policy_model, который на время
-        forward/generate отключает LoRA-адаптер. Экономия памяти ≈ полный размер базы.
-      - False: старое поведение — отдельная «замороженная» копия базы (нужна, если ref
-        передаётся в код, который ожидает полноценный PreTrainedModel, например TRL DPOTrainer).
-      - Если use_lora=False и resume_from=None, policy не является PeftModel, поэтому
-        shared ref невозможен и всегда используется отдельная копия (с предупреждением в stderr).
+      - True (default) with LoRA: no separate base for ref
+        is loaded; returns _PeftRefProxy over policy_model that disables LoRA during
+        forward/generate. Memory savings ~= one full base.
+      - False: legacy — separate frozen base copy (needed when ref
+        is passed to code expecting a real PreTrainedModel, e.g. TRL DPOTrainer).
+      - If use_lora=False and resume_from=None, policy is not PeftModel, so
+        shared ref is impossible and a separate copy is always used (stderr warning).
 
     Returns:
         tokenizer, policy_model, ref_model, device_gpu
@@ -228,14 +218,14 @@ def load_models_and_tokenizer(
     policy_is_peft = bool(resume_from) or use_lora
     load_separate_ref = (not share_ref_with_policy) or (not policy_is_peft)
     if not share_ref_with_policy and not policy_is_peft:
-        # Явный запрос на отдельный ref при непоефтной policy — валидно, просто подсвечу.
+        # Explicit separate ref with non-PEFT policy — valid, just noting.
         pass
     if share_ref_with_policy and not policy_is_peft:
         import sys
 
         print(
-            "Warning: share_ref_with_policy=True запрошен, но policy не PeftModel "
-            "(use_lora=False и resume_from=None) — грузим отдельный ref_model.",
+            "Warning: share_ref_with_policy=True requested but policy is not PeftModel "
+            "(use_lora=False and resume_from=None) — loading separate ref_model.",
             file=sys.stderr,
         )
 
@@ -258,8 +248,8 @@ def load_models_and_tokenizer(
     policy_model.config.use_cache = False
 
     if resume_from:
-        # Без is_trainable=True PEFT оставляет LoRA замороженной (trainable params: 0)
-        # и дообучение молча не идёт; чекпоинты часто сохраняются с inference_mode=True.
+        # Without is_trainable=True PEFT keeps LoRA frozen (trainable params: 0)
+        # and finetuning silently does nothing; checkpoints often saved under inference_mode=True.
         policy_model = PeftModel.from_pretrained(
             policy_model, adapter_dir, is_trainable=True
         )
@@ -292,7 +282,7 @@ def load_models_and_tokenizer(
         print("Warning: gradient checkpointing skipped (no enable_input_require_grads); training will use more VRAM.", file=sys.stderr)
 
     if ref_model is None:
-        # policy_is_peft гарантирован (иначе выше load_separate_ref=True).
+        # policy_is_peft is guaranteed (else load_separate_ref would be True above).
         ref_model = _PeftRefProxy(policy_model)
 
     return tokenizer, policy_model, ref_model, device_gpu

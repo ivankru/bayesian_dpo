@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-UltraFeedback (HuggingFaceH4/ultrafeedback_binarized) для soft-DPO.
+UltraFeedback (HuggingFaceH4/ultrafeedback_binarized) for soft-DPO.
 
-- ultrafeedback_binarized (CLI): жёсткое предпочтение chosen > rejected, p ∈ {0, 1} после шума.
-- ultrafeedback_soft (CLI): мягкие метки p = sigmoid(score_chosen - score_rejected).
+- ultrafeedback_binarized (CLI): hard preference chosen > rejected, p ∈ {0, 1} after noise.
+- ultrafeedback_soft (CLI): soft labels p = sigmoid(score_chosen - score_rejected).
 
-Семантика CLI: ранее в soft_dpo_steer --dataset ultrafeedback_binarized соответствовала
-поведению нынешнего ultrafeedback_soft; после разделения бинарный режим вынесен в
-ultrafeedback_binarized, прежний score-soft — в ultrafeedback_soft.
+CLI semantics: previously soft_dpo_steer --dataset ultrafeedback_binarized matched
+current ultrafeedback_soft behavior; after the split, binary mode is ultrafeedback_binarized,
+and the former score-soft path is ultrafeedback_soft.
 """
 import random
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,9 +25,9 @@ def flip_binary_labels(
     col_name: str = "p",
 ) -> Dataset:
     """
-    С заданной вероятностью noise_prob инвертирует целевую вероятность в col_name:
-    для p ∈ {0, 1} — переворот 0↔1; иначе p → 1−p. После этого пересчитывает p_bayes
-    как (alpha + p) / (2*alpha + 1).
+    With probability noise_prob inverts target probability in col_name:
+    for p ∈ {0, 1} flip 0↔1; else p → 1−p. Then recomputes p_bayes as
+    (alpha + p) / (2*alpha + 1).
     """
     if noise_prob <= 0.0:
         return ds
@@ -54,7 +54,7 @@ def extract_pair_ultrafeedback_binarized(
     example: Dict[str, Any], alpha: float = 1.0
 ) -> Optional[Dict[str, Any]]:
     """
-    Жёсткое предпочтение (как hard-DPO): resp1=chosen, resp2=rejected, p=1.0.
+    Hard preference (like hard-DPO): resp1=chosen, resp2=rejected, p=1.0.
     p_bayes = (alpha + p) / (2*alpha + 1).
     """
     prompt = example["prompt"] if isinstance(example["prompt"], str) else example["prompt"].strip()
@@ -77,7 +77,7 @@ def extract_pair_ultrafeedback_score_soft(
     example: Dict[str, Any], alpha: float = 1.0
 ) -> Optional[Dict[str, Any]]:
     """
-    Мягкие метки по скорам: resp1=chosen, resp2=rejected,
+    Soft labels from scores: resp1=chosen, resp2=rejected,
     p = sigmoid(score_chosen - score_rejected), p_bayes = (alpha + p) / (2*alpha + 1).
     """
     prompt = example["prompt"] if isinstance(example["prompt"], str) else example["prompt"].strip()
@@ -120,8 +120,8 @@ def build_ultrafeedback_binarized_soft_datasets(
     seed: int = 42,
 ):
     """
-    UltraFeedback Binarized: бинарные целевые метки (p=1 до шума), валидация hard.
-    Возвращает: train_soft_ds, val_hard_ds, hard_train_size.
+    UltraFeedback Binarized: binary targets (p=1 before noise), hard validation.
+    Returns: train_soft_ds, val_hard_ds, hard_train_size.
     """
     train_raw, val_raw = _load_ultrafeedback_binarized_prefs()
 
@@ -150,9 +150,9 @@ def build_ultrafeedback_score_soft_datasets(
     seed: int = 42,
 ):
     """
-    UltraFeedback Binarized с мягкими метками из score_chosen/score_rejected (sigmoid).
-    При --label-noise-prob > 0: с той же вероятностью p → 1−p и пересчёт p_bayes.
-    Возвращает: train_soft_ds, val_hard_ds, hard_train_size.
+    UltraFeedback Binarized with soft labels from score_chosen/score_rejected (sigmoid).
+    With --label-noise-prob > 0: same probability flips p → 1−p and recomputes p_bayes.
+    Returns: train_soft_ds, val_hard_ds, hard_train_size.
     """
     train_raw, val_raw = _load_ultrafeedback_binarized_prefs()
 

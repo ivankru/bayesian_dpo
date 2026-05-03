@@ -1,2 +1,2 @@
 # -*- coding: utf-8 -*-
-"""Пакет конфигурации: базовые константы прогона (редко меняются между экспериментами)."""
+"""Configuration package: base run constants (rarely change between experiments)."""

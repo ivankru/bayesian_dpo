@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Агрегаты по окну шагов: |p_gt − p_pred_cached| и |p_target − p_gt| (anchor / teacher mix).
+Window aggregates: |p_gt − p_pred_cached| and |p_target − p_gt| (anchor / teacher mix).
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 
 
 def _mean_top_fraction(x: np.ndarray, upper_frac: float) -> float:
-    """Среднее по наибольшим ceil(upper_frac * n) значениям (upper_frac=0.1 → top 10%)."""
+    """Mean over the largest ceil(upper_frac * n) values (upper_frac=0.1 → top 10%)."""
     n = int(x.size)
     if n == 0:
         return float("nan")
@@ -25,8 +25,8 @@ def aggregate_anchor_alignment_window(
     target_shift_parts: List[np.ndarray],
 ) -> Dict[str, float]:
     """
-    gap_abs: фрагменты |p_gt − p_pred_cached| (если в батче был p_pred_cached).
-    target_shift: фрагменты |p_target − p_gt|.
+    gap_abs: chunks of |p_gt − p_pred_cached| (if batch had p_pred_cached).
+    target_shift: chunks of |p_target − p_gt|.
     """
     out: Dict[str, float] = {}
     if target_shift_parts:
@@ -59,7 +59,7 @@ def aggregate_anchor_alignment_window(
 
 
 def format_anchor_alignment_log(m: Dict[str, float]) -> str:
-    """Одна строка для train.log (после основной строки loss)."""
+    """One line for train.log (after the main loss line)."""
     parts = [
         f"target_shift_mean={m['target_shift_mean']:.4f}",
         f"target_shift_frac_gt_0.1={100.0 * m['target_shift_frac_gt_0.1']:.2f}%",

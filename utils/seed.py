@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Воспроизводимость: установка seed для random, numpy, torch.
+"""Reproducibility: set seeds for random, numpy, torch.
 
-Обычному DPO-обучению НЕ нужна полная детерминированность — она только замедляет
-обучение (cudnn autotuner выключен, детерминированные алгоритмы медленнее), а в
-bf16-трансформерах без свёрток вообще почти не даёт ничего: на уровне cuDNN
-трансформер — это набор matmul, у которых в bf16 всё равно нет «перебора
-алгоритмов». Поэтому по умолчанию мы только фиксируем seed для Python/NumPy/Torch
-(этого хватает для одинаковых данных, shuffle и инициализации LoRA), а флаги
-cuDNN и torch.use_deterministic_algorithms не трогаем — остаются дефолты PyTorch
+Typical DPO training does NOT need full determinism — it only slows training
+(cudnn autotuner off, deterministic kernels slower), and in bf16 transformers without convolutions
+it barely changes numerics: for cuDNN a transformer is mostly matmuls with no meaningful
+"algorithm search" in bf16. So by default we only fix Python/NumPy/Torch seeds
+(enough for identical data, shuffle, and LoRA init) and leave
+cuDNN and torch.use_deterministic_algorithms untouched — PyTorch defaults
 (deterministic=False, benchmark=False).
 
-Если нужна *строгая* битовая воспроизводимость (например, для A/B-сравнения с
-идентичным seed), передавайте deterministic=True. Имейте в виду:
-  1) cudnn.deterministic=True и cudnn.benchmark=False отключат autotuner;
-  2) torch.use_deterministic_algorithms(True) форсит детерминированные ядра и
-     поднимает исключение на операциях, у которых детерминированной реализации
-     нет — поэтому оборачиваем warn_only=True, чтобы не валить обучение;
-  3) для детерминированного CUBLAS нужна переменная окружения
-     CUBLAS_WORKSPACE_CONFIG, её мы выставляем здесь же (если ещё не задана).
-Ожидаемое замедление — 10–30% на LLM-обучении, поэтому включать осознанно.
+For *strict* bitwise reproducibility (e.g. A/B with identical seed), pass deterministic=True. Note:
+  1) cudnn.deterministic=True and cudnn.benchmark=False disable the autotuner;
+  2) torch.use_deterministic_algorithms(True) forces deterministic kernels and
+     errors on ops without a deterministic implementation — we use warn_only=True so training keeps going;
+  3) deterministic CUBLAS needs env var CUBLAS_WORKSPACE_CONFIG; we set it here if unset.
+Expect ~10–30% slowdown on LLM training; enable deliberately.
 """
 import os
 import random
@@ -29,13 +25,12 @@ import torch
 
 def set_seed(seed: int = 42, deterministic: bool = False) -> None:
     """
-    Фиксирует seed для Python random, NumPy и Torch (+ CUDA-seed при наличии GPU).
+    Fix seeds for Python random, NumPy, and Torch (+ CUDA when a GPU is present).
 
-    deterministic: если True, включает строгий детерминированный режим cuDNN/CUBLAS.
-      По умолчанию False — достаточный для «одинаковых экспериментов с одинаковым
-      seed», но без штрафа по скорости от отключения cuDNN autotuner и форса
-      детерминированных ядер. Включайте True только когда битовая
-      воспроизводимость действительно нужна.
+    deterministic: if True, enable strict deterministic cuDNN/CUBLAS behavior.
+      Default False — enough for "same experiment with same seed"
+      without the speed hit from disabling cudnn autotuner and forcing deterministic kernels.
+      Use True only when bitwise reproducibility is required.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -44,12 +39,10 @@ def set_seed(seed: int = 42, deterministic: bool = False) -> None:
         torch.cuda.manual_seed_all(seed)
 
     if deterministic:
-        # CUBLAS требует workspace config для детерминированности matmul на CUDA.
-        # Если пользователь уже задал своё значение — уважаем его.
+        # CUBLAS needs workspace config for deterministic matmul on CUDA.
+        # If the user already set a value, keep it.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        # warn_only=True: на операциях без детерминированной реализации
-        # будет warning, но обучение не упадёт — это безопаснее, чем исключение
-        # в середине эпохи.
+        # warn_only=True: ops without a deterministic implementation warn but do not crash mid-epoch.
         torch.use_deterministic_algorithms(True, warn_only=True)

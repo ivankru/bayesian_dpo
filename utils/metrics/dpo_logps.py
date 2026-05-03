@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Метрики и утилиты для DPO: get_logps, eval_pairwise_accuracy, eval_pairwise_nll.
+DPO metrics and helpers: get_logps, eval_pairwise_accuracy, eval_pairwise_nll.
 """
 from typing import List, Optional
 
@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 
 def _apply_chat_template_ids(tokenizer, user_content: str) -> List[int]:
-    """Префикс диалога Qwen-Instruct до начала генерации ответа ассистента (включая assistant header)."""
+    """Qwen-Instruct chat prefix up to assistant generation start (includes assistant header)."""
     out = tokenizer.apply_chat_template(
         [{"role": "user", "content": user_content}],
         tokenize=True,
@@ -32,15 +32,15 @@ def get_logps(
     use_chat_template: bool = False,
 ) -> torch.Tensor:
     """
-    log p(response | prompt) = сумма логвероятностей токенов ответа.
+    log p(response | prompt) = sum of token log-probs on the response.
 
-    use_chat_template=False: как раньше — склейка plain text ``prompt + "\\n" + response`` и длина
-    префикса по отдельной токенизации prompt (без chat template).
+    use_chat_template=False: legacy plain ``prompt + "\\n" + response`` and prefix length
+    from a separate prompt tokenization (no chat template).
 
-    use_chat_template=True (Qwen2.5-Instruct и аналоги): префикс через ``apply_chat_template`` одного
-    user-турна (вся сериализованная реплика/диалог в строке prompt), затем токены ответа ассистента
-    без повторного add_special_tokens, чтобы не ломать границу BPE. Лог-вероятности суммируются
-    только по суффиксу ответа, не по префиксу чата.
+    use_chat_template=True (Qwen2.5-Instruct, etc.): prefix via ``apply_chat_template`` for one
+    user turn (serialized prompt string), then assistant response tokens
+    with add_special_tokens=False to preserve BPE boundaries. Log-probs sum
+    only over the response suffix, not the chat prefix.
     """
     if not use_chat_template:
         prompt_batch = tokenizer(
@@ -90,13 +90,13 @@ def get_logps(
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
 
-    # max_prompt_len должен оставлять место хотя бы под 1 токен ответа; иначе любой длинный промпт
-    # выдавал бы пустой ответный суффикс и log p = 0 (градиент и метрики молча зануляются).
+    # max_prompt_len must leave room for at least one response token; else long prompts
+    # yield an empty response suffix and log p = 0 (gradients and metrics silently vanish).
     effective_max_prompt_len = min(int(max_prompt_len), int(max_full_len) - 1)
     if effective_max_prompt_len < 1:
         raise ValueError(
-            f"max_full_len={max_full_len} слишком мал для max_prompt_len={max_prompt_len}: "
-            "не остаётся места под ответ."
+            f"max_full_len={max_full_len} too small for max_prompt_len={max_prompt_len}: "
+            "no room left for a response."
         )
 
     batch_input_ids: List[List[int]] = []
@@ -104,14 +104,14 @@ def get_logps(
 
     for p, r in zip(prompts, responses):
         p_ids = _apply_chat_template_ids(tokenizer, p)
-        # Обрезаем prompt *слева*, сохраняя хвост chat template (…<|im_start|>assistant\n):
-        # именно конец префикса определяет условие генерации ответа, терять его нельзя.
+        # Truncate prompt from the *left*, keep chat-template tail (…<|im_start|>assistant\n):
+        # the prefix tail defines the response-conditioning context; do not drop it.
         if len(p_ids) > effective_max_prompt_len:
             p_ids = p_ids[-effective_max_prompt_len:]
 
         r_ids = tokenizer(r, add_special_tokens=False)["input_ids"]
         max_resp_len = int(max_full_len) - len(p_ids)
-        # effective_max_prompt_len <= max_full_len - 1, поэтому max_resp_len >= 1 всегда.
+        # effective_max_prompt_len <= max_full_len - 1, so max_resp_len >= 1 always.
         if len(r_ids) > max_resp_len:
             r_ids = r_ids[:max_resp_len]
 
@@ -159,7 +159,7 @@ def eval_pairwise_accuracy(
     use_chat_template: bool = False,
     desc: Optional[str] = None,
 ):
-    """Доля пар, где модель правильно предпочитает chosen над rejected."""
+    """Fraction of pairs where the model prefers chosen over rejected."""
     policy_model.eval()
     correct = 0
     total = 0
@@ -208,7 +208,7 @@ def eval_pairwise_nll(
     use_chat_template: bool = False,
     desc: Optional[str] = None,
 ):
-    """Pairwise NLL по всем сэмплам (chosen vs rejected). Агрегация по сумме NLL / кол-во сэмплов, не по батчам."""
+    """Pairwise NLL over all samples (chosen vs rejected). Aggregate as sum(NLL) / num samples, not per-batch mean."""
     policy_model.eval()
     total_nll = 0.0
     total_count = 0

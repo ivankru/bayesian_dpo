@@ -22,7 +22,7 @@ def soft_dpo_approximation_loss(
     **kwargs,
 ):
     """
-    Soft-DPO approximation в масштабе old_loss / beta.
+    Soft-DPO approximation in the old_loss / beta scale.
     """
     if beta <= 0:
         raise ValueError(f"beta must be > 0, got {beta!r}")
@@ -64,7 +64,7 @@ def soft_dpo_centered_softplus_loss(
     **kwargs,
 ):
     """
-    Soft-DPO с centered softplus в масштабе old_loss / beta.
+    Soft-DPO with centered softplus in the old_loss / beta scale.
     """
     return _compute_soft_loss_common(
         batch,

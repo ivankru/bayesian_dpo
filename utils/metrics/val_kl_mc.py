@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Monte Carlo оценка forward KL(π_θ || π_ref) по сэмплам y ~ π_θ(·|x).
+Monte Carlo estimate of forward KL(π_θ || π_ref) from samples y ~ π_θ(·|x).
 
-Это среднее лог-отношения E_{x~D, y~π_θ(·|x)}[ log π_θ(y|x) - log π_ref(y|x) ], где D — выбор промптов
-из val (отдельно от распределения данных preference-датасета). При достаточном числе сэмплов это даёт
-несмещённую (по y) оценку ∫ π_θ(y|x) log(π_θ(y|x)/π_ref(y|x)) dy для каждого x, усреднённую по
-выбранным промптам — т.е. sample-based MC по политике, а не по фиксированным chosen/rejected из данных.
+Mean log-ratio E_{x~D, y~π_θ(·|x)}[ log π_θ(y|x) - log π_ref(y|x) ] where D is a prompt draw
+from val (distinct from the preference dataset distribution). With enough samples this is an
+unbiased-in-y estimate of ∫ π_θ(y|x) log(π_θ(y|x)/π_ref(y|x)) dy per x, averaged over prompts —
+i.e. policy-based sample MC, not fixed chosen/rejected strings from data.
 """
 from typing import Dict, List, Sequence, Tuple
 
@@ -16,7 +16,7 @@ from tqdm import tqdm
 from .dpo_logps import get_logps
 
 def _effective_tokenizer_cap(tokenizer) -> int:
-    """Верхняя граница длины для truncation из tokenizer; без привязки к MAX_PROMPT_LEN в config."""
+    """Upper bound on length for tokenizer truncation; not tied to MAX_PROMPT_LEN in config."""
     cap = getattr(tokenizer, "model_max_length", None)
     if cap is None or cap <= 0 or cap > 1_000_000:
         cap = 8192
@@ -54,10 +54,10 @@ def _sum_logprobs_on_generated_suffix(
     pad_token_id: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Считает сумму log p(y_t | x, y_<t>) по суффиксу y = seq_ids[:, suffix_start:].
-    Возвращает:
-      - seq_logp: [B] суммарные лог-вероятности по суффиксу
-      - tok_count: [B] число учтённых токенов в суффиксе
+    Sum log p(y_t | x, y_<t) over suffix y = seq_ids[:, suffix_start:].
+    Returns:
+      - seq_logp: [B] total log-prob on the suffix
+      - tok_count: [B] counted tokens in the suffix
     """
     # logits[:, t-1] predicts token at position t
     out = model(input_ids=seq_ids, attention_mask=seq_attn)
@@ -87,9 +87,9 @@ def _build_full_attention_mask(
     """
     base_attention_mask: [B, Tin]
     generated: [B*K, Tout] where Tout >= Tin
-    Возвращает attention mask [B*K, Tout]:
-      - первые Tin позиций: повторённая base mask
-      - для сгенерированного хвоста: единицы
+    Returns attention mask [B*K, Tout]:
+      - first Tin positions: repeated base mask
+      - generated tail: ones
     """
     b = base_attention_mask.size(0)
     bk = generated.size(0)
@@ -118,19 +118,18 @@ def estimate_val_kl_mc(
     show_progress: bool = True,
 ) -> Dict[str, float]:
     """
-    MC-оценка forward KL(π_θ || π_ref). Возвращает dict:
+    MC estimate of forward KL(π_θ || π_ref). Returns dict:
 
-    - ``per_seq``: (1/N) Σ_i [ log π_θ(y_i|x_i) - log π_ref(y_i|x_i) ], где y_i ~ π_θ(·|x_i), N = P*K.
-      «Среднее лог-отношение на последовательность». Зависит от средней длины генерации —
-      плохо для кросс-прогонных сравнений.
+    - ``per_seq``: (1/N) Σ_i [ log π_θ(y_i|x_i) - log π_ref(y_i|x_i) ], y_i ~ π_θ(·|x_i), N = P*K.
+      Mean log-ratio per sequence. Depends on average generation length —
+      weak for cross-run comparisons.
     - ``per_token``: Σ_i [ log π_θ(y_i|x_i) - log π_ref(y_i|x_i) ] / Σ_i n_tokens(y_i).
-      «KL на токен». Инвариантна к длине ответа, что делает её предпочтительной для
-      сравнения прогонов с разной длиной генерации.
-    - ``total_seqs``: фактическое число просчитанных последовательностей.
-    - ``total_tokens``: суммарное число ответных токенов (∑ n_tokens).
+      KL per token. Length-invariant, preferred when comparing runs with different generation lengths.
+    - ``total_seqs``: number of sequences actually scored.
+    - ``total_tokens``: total response tokens (∑ n_tokens).
 
-    Память: промпты батчами по ``prompt_batch_size``; лог-вероятности и лог-отношения накоплениями по
-    микробатчам ``logp_score_batch_size`` без хранения всех строк одновременно.
+    Memory: prompts in batches of ``prompt_batch_size``; log-probs and log-ratios accumulated in
+    microbatches of ``logp_score_batch_size`` without holding all strings at once.
     """
     if num_samples_per_prompt < 1:
         raise ValueError(f"num_samples_per_prompt must be >= 1, got {num_samples_per_prompt}")
@@ -154,7 +153,7 @@ def estimate_val_kl_mc(
     if temperature is not None and temperature > 0:
         gen_kwargs["do_sample"] = True
         gen_kwargs["temperature"] = float(temperature)
-        # top_k=0 отключает TopKLogitsWarper в HF (иначе остался бы дефолт generation_config.top_k=50)
+        # top_k=0 disables TopKLogitsWarper in HF (else default generation_config.top_k=50 would apply)
         gen_kwargs["top_k"] = int(top_k)
         if top_p < 1.0:
             gen_kwargs["top_p"] = float(top_p)

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Загрузка eval_datasets, генерация (chat template Qwen) и подсчёт метрик удержания
-(ref vs policy по gold). Используется train_dpo и eval_capability_retention.py (локальный CLI).
+Load eval_datasets, generate (Qwen chat template), and compute retention metrics
+(ref vs policy vs gold). Used by train_dpo and eval_capability_retention.py (local CLI).
 """
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ def load_eval_rows(eval_dir: Path) -> List[EvalRow]:
                 rec = json.loads(line)
                 prompt = rec.get("input")
                 if not isinstance(prompt, str) or not prompt.strip():
-                    raise ValueError(f"{path}:{idx+1}: нет непустого поля input")
+                    raise ValueError(f"{path}:{idx+1}: missing non-empty input field")
                 src = str(rec.get("source", path.stem))
                 task = str(rec.get("task", ""))
                 eid = f"{path.name}:{idx}"
@@ -256,11 +256,11 @@ def _gold_aqua_rat(rec: Dict[str, Any]) -> str:
     m = re.search(r"\b([A-E])\b", s)
     if m:
         return m.group(1)
-    raise ValueError(f"aqua_rat: нет метки A–E в correct_label/correct: {raw!r}")
+    raise ValueError(f"aqua_rat: no A–E label in correct_label/correct: {raw!r}")
 
 
 def _parse_aqua_rat(text: str) -> Optional[str]:
-    """Последняя буква A–E (часто финальный ответ после рассуждения)."""
+    """Last letter A–E (often the final answer after reasoning)."""
     matches = list(re.finditer(r"\b([A-E])\b", text.upper()))
     if not matches:
         return None
@@ -341,7 +341,7 @@ def gold_and_kind(rec: Dict[str, Any], source: str) -> Tuple[str, Any, str]:
     if "gsm8k" in src:
         g = _gold_gsm8k_number(rec)
         return "gsm8k", g, "gsm8k"
-    raise ValueError(f"Неизвестный source для gold: {source!r}, keys={list(rec.keys())}")
+    raise ValueError(f"Unknown source for gold: {source!r}, keys={list(rec.keys())}")
 
 
 def parse_prediction(text: str, parse_kind: str, rec: Dict[str, Any]) -> Optional[str]:
@@ -590,8 +590,8 @@ def run_retention_eval_pair(
     desc_pol: str,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Генерация ref (кэшируемая) + policy, подсчёт метрик.
-    Возвращает (summary, ref_texts для кэша).
+    Generate ref (cacheable) + policy, compute metrics.
+    Returns (summary, ref_texts for cache).
     """
     prompts = [r.prompt for r in rows]
     if cached_ref_texts is None:
@@ -624,7 +624,7 @@ def run_retention_eval_pair(
 def log_mlflow_capability_metrics(
     summary: Dict[str, Any], step: int, log_metric: Callable[[str, float, int], None],
 ) -> None:
-    """log_metric(name, value, step) — как mlflow.log_metric."""
+    """log_metric(name, value, step) — same contract as mlflow.log_metric."""
     for scope in ("overall", "knowledge", "reasoning"):
         s = summary.get(scope)
         if not isinstance(s, dict) or int(s.get("n", 0)) == 0:

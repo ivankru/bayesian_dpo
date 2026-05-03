@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Общий цикл обучения одной эпохи для DPO и универсальная функция train_dpo (режимы hard / soft / bayes).
+Shared one-epoch DPO training loop and universal train_dpo (hard / soft / bayes modes).
 """
 import json
 import math
@@ -63,10 +63,10 @@ from utils.val_distributions import compute_val_delta_distributions
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
 OPTIMIZER_CHOICES = ("adamw", "sgd")
 
-# MC forward KL(π‖ref) по сэмплам с π_θ; min(N, len(val)) промптов. 0 в val_kl_mc_max_prompts — отключить.
+# MC forward KL(π‖ref) from π_θ samples; min(N, len(val)) prompts. 0 in val_kl_mc_max_prompts disables.
 DEFAULT_VAL_KL_MC_MAX_PROMPTS = 256
 
-# Soft/Bayes-ADPO: половинная эпоха — валидация и обновление lambda / p_pred_cached.
+# Soft/Bayes-ADPO: half-epoch validation and lambda / p_pred_cached update.
 ULTRAFB_MID_EPOCH_DATASETS = frozenset(
     {"openbmb", "ultrafeedback_binarized", "ultrafeedback_soft", "hh_rlhf"}
 )
@@ -74,7 +74,7 @@ ULTRAFB_MID_EPOCH_DATASETS = frozenset(
 
 def infer_run_root_from_checkpoint_dir(resume_checkpoint_dir: str) -> Optional[Path]:
     """
-    Корень прогона (родительская папка с train.log): .../best, .../epochs/epoch_XXX, иначе parent.
+    Run root (parent dir with train.log): .../best, .../epochs/epoch_XXX, else parent.
     """
     p = Path(resume_checkpoint_dir).expanduser()
     try:
@@ -88,7 +88,7 @@ def infer_run_root_from_checkpoint_dir(resume_checkpoint_dir: str) -> Optional[P
         return p.parent
     if p.parent.name == "epochs" and re.match(r"^epoch_\d{3}$", name):
         return p.parent.parent
-    # Корень прогона (output_dir): адаптер лежит в best/, train.log рядом
+    # Run root (output_dir): adapter under best/, train.log alongside
     if (p / "best" / "adapter_config.json").is_file():
         return p
     return p.parent
@@ -100,15 +100,15 @@ def slice_train_log_lines_before_resume_start_epoch(
     resume_start_epoch_1based: int,
 ) -> List[str]:
     """
-    Строки train.log до начала эпохи resume_start_epoch_1based (1-based).
-    Soft/bayes: обрезка перед строкой «=== Epoch S ===» или «=== Epoch S/E ===» (новый формат).
-    Hard: обрезка перед первой строкой «[epoch S]» (обучение эпохи S; формат не менялся).
+    train.log lines before epoch resume_start_epoch_1based (1-based).
+    Soft/bayes: cut before line «=== Epoch S ===» or «=== Epoch S/E ===» (new format).
+    Hard: cut before first line «[epoch S]» (training epoch S; format unchanged).
     """
     s = int(resume_start_epoch_1based)
     if s <= 1:
         return []
     if mode in ("soft", "bayes"):
-        # Принимаем оба формата: старый "=== Epoch S ===" и новый "=== Epoch S/E ===".
+        # Accept both legacy "=== Epoch S ===" and new "=== Epoch S/E ===".
         boundary = re.compile(rf"^\s*=== Epoch {s}(?:/\d+)? ===\s*$")
         for i, line in enumerate(lines):
             if boundary.match(line):
@@ -126,7 +126,7 @@ def slice_train_log_lines_before_resume_start_epoch(
 def _lambda_label_at_progress(
     progress: float, lambda_min: float, lambda_schedule: str
 ) -> float:
-    """progress in [0, 1]: как в основном цикле эпох (linear / cosine)."""
+    """progress in [0, 1]: same as main epoch loop (linear / cosine)."""
     progress = max(0.0, min(1.0, float(progress)))
     if lambda_schedule == "linear":
         return 1.0 - (1.0 - lambda_min) * progress
@@ -140,50 +140,50 @@ def _lambda_schedule_progress(
     mid_frac: float,
 ) -> float:
     """
-    Доля [0, 1] для аргумента _lambda_label_at_progress. Формула симметрична
-    «эпоха-к-эпохе» между режимами k=0 и k>0: при одинаковых (epochs, epoch_idx_0)
-    начало каждой эпохи даёт один и тот же progress в обоих режимах, если
-    трактовать первую эпоху при k=0 как warmup-по-меткам, а при k>0 — как явный
-    warmup длиной k эпох. Это нужно для двух вещей:
-      (a) честного сравнения k=0 vs k>0 при одинаковом total epochs;
-      (b) чтобы resume сразу после эпохи k (resume_start_epoch_1based == k+1)
-          стартовал с λ<1 с первого же шага, а не тратил ещё одну эпоху на λ=1.
+    Fraction in [0, 1] passed to _lambda_label_at_progress. The map is symmetric
+    epoch-to-epoch between k=0 and k>0: for the same (epochs, epoch_idx_0),
+    epoch starts share the same progress in both modes if epoch 1 at k=0 is
+    treated as implicit label-warmup and at k>0 as explicit k-epoch warmup. This
+    enables:
+      (a) fair k=0 vs k>0 comparisons for the same total epochs;
+      (b) resume right after epoch k (resume_start_epoch_1based == k+1) to start
+          with λ<1 on the first step instead of spending another epoch at λ=1.
 
-    lambda_full_epochs == 0 (без warmup-анкора):
+    lambda_full_epochs == 0 (no warmup anchor):
         progress = (epoch_idx_0 + mid_frac) / (epochs - 1).
-        Первая эпоха (idx=0, mid=0): progress=0 → λ=1 — неявный warmup-по-меткам;
-        последняя (idx=epochs-1, mid=0): progress=1 → λ=lambda_min.
+        First epoch (idx=0, mid=0): progress=0 → λ=1 (implicit label warmup);
+        last (idx=epochs-1, mid=0): progress=1 → λ=lambda_min.
 
-    lambda_full_epochs == k > 0 (warmup-анкор: эпохи 1..k только метки, в конце
-    эпохи k фиксируется p_pred_teacher):
+    lambda_full_epochs == k > 0 (warmup anchor: epochs 1..k labels only; end of
+    epoch k fixes p_pred_teacher):
         warmup 1..k → progress = 0 → λ = 1;
-        хвост k+1..epochs (decay_epochs = epochs - k эпох):
+        tail k+1..epochs (decay_epochs = epochs - k epochs):
             rel = (epoch_idx_0 - k) + mid_frac;
             progress = (rel + 1) / decay_epochs.
-        Начало первой хвостовой (rel=0): progress = 1/decay → λ<1 сразу.
-        Конец последней (rel=decay-1, mid=0 на ней же): progress = 1 → λ=lambda_min.
+        Start of first tail epoch (rel=0): progress = 1/decay → λ<1 immediately.
+        End of last (rel=decay-1, mid=0 on that epoch): progress = 1 → λ=lambda_min.
 
-    Проверка симметрии «эпоха-к-эпохе» на epochs=5:
+    Symmetry check for epochs=5:
         k=0: epoch starts → [0, 0.25, 0.5, 0.75, 1.0]
         k=1: epoch starts → [warmup=0, 0.25, 0.5, 0.75, 1.0]
         k=2: epoch starts → [warmup=0, warmup=0, 1/3, 2/3, 1.0]
-    Расписание хвоста укладывается в decay_epochs эпох так, что первая хвостовая
-    уже делает активный шаг (а не дублирует warmup).
+    The tail schedule spans decay_epochs epochs so the first tail step is active
+    (not duplicating warmup).
 
     Edge cases:
-      - decay_epochs <= 0 (k >= epochs): хвоста нет, всё warmup → progress=0.
-      - decay_epochs == 1 (единственная хвостовая эпоха): progress = 1 сразу
-        (λ=lambda_min на всей этой эпохе).
-      - epochs <= 1: тривиально, 0.5 / 1.0 по mid_frac.
+      - decay_epochs <= 0 (k >= epochs): no tail, all warmup → progress=0.
+      - decay_epochs == 1 (single tail epoch): progress = 1 immediately
+        (λ=lambda_min for that whole epoch).
+      - epochs <= 1: trivial, 0.5 / 1.0 by mid_frac.
 
-    Расписание детерминировано по (epoch_idx_0, epochs, k, mid_frac) — resume с
-    любого resume_start_epoch_1based даёт ту же λ, что и непрерывный прогон при
-    тех же параметрах. Для resume ровно на первой хвостовой эпохе
-    (resume_start_epoch_1based == k+1) p_pred_teacher пересчитывается по
-    ЗАГРУЖЕННЫМ весам (см. train_dpo) — эквивалентно концу эпохи k в непрерывном
-    прогоне, и λ<1 включается с первого шага после загрузки.
+    Determined by (epoch_idx_0, epochs, k, mid_frac) — resume from any
+    resume_start_epoch_1based yields the same λ as a continuous run with the same
+    hyperparameters. Resuming exactly on the first tail epoch
+    (resume_start_epoch_1based == k+1) recomputes p_pred_teacher from LOADED
+    weights (see train_dpo) — equivalent to end of epoch k in a continuous run,
+    and λ<1 applies from the first step after load.
 
-    mid_frac: 0 — начало эпохи; 0.5 — середина (для mid-epoch валидации).
+    mid_frac: 0 — epoch start; 0.5 — mid-epoch (mid-epoch validation).
     """
     if epochs <= 1:
         return 0.5 if mid_frac > 0 else 1.0
@@ -203,8 +203,8 @@ def _lambda_schedule_progress(
 
 def _val_resp_entropy_vocab_nats_max(tokenizer, policy_model) -> Tuple[int, float]:
     """
-    V и log(V) в натах: верхняя граница энтропии одного шага при равномерном softmax
-    по полному словарю (как в estimate_val_response_entropy).
+    V and log(V) in nats: upper bound on one-step entropy under uniform softmax
+    over the full vocabulary (as in estimate_val_response_entropy).
     """
     cfg = getattr(policy_model, "config", None)
     v = getattr(cfg, "vocab_size", None) if cfg is not None else None
@@ -227,7 +227,7 @@ def _log_val_response_entropy_two_lines(
     n_prompts: int,
     num_samples: int,
 ) -> None:
-    """Две строки в лог: абсолютные наты (с max = log V) и те же статистики в % от max."""
+    """Two log lines: absolute nats (max = log V) and the same stats as % of max."""
     v, log_v = _val_resp_entropy_vocab_nats_max(tokenizer, policy_model)
     hdr = (
         "validation response entropy "
@@ -267,11 +267,11 @@ def _make_shuffled_train_loader(
     batch_size: int,
     generator: torch.Generator,
 ) -> DataLoader:
-    """Тренировочный DataLoader с shuffle через переданный torch.Generator.
+    """Training DataLoader with shuffle via the given torch.Generator.
 
-    Единая точка сборки: все перезапуски после precompute_p_pred_* используют
-    один и тот же `generator` (продолжает серию рандома от seed), num_workers=0
-    для детерминированного порядка батчей.
+    Single construction site: all restarts after precompute_p_pred_* share the
+    same `generator` (continues RNG from seed), num_workers=0 for deterministic
+    batch order.
     """
     return DataLoader(
         ds,
@@ -288,7 +288,7 @@ def _make_ordered_loader(
     collate_fn,
     batch_size: int,
 ) -> DataLoader:
-    """DataLoader без shuffle для валидации и для фиксированных split'ов эпохи."""
+    """DataLoader without shuffle for validation and fixed epoch splits."""
     return DataLoader(
         ds,
         batch_size=batch_size,
@@ -305,9 +305,9 @@ def _build_loss_spec(
     p_pred_target_temperature: float,
     soft_loss_type: str,
 ) -> Tuple[Callable, Callable, Dict[str, Any], str]:
-    """По режиму возвращает (train_collate, train_loss_fn, loss_kwargs, mode_label).
+    """Return (train_collate, train_loss_fn, loss_kwargs, mode_label) for the mode.
 
-    Чистая функция; mode уже должен быть провалидирован против DPO_MODE_CHOICES.
+    Pure function; mode must already be validated against DPO_MODE_CHOICES.
     """
     if mode == "hard":
         return (
@@ -353,10 +353,10 @@ def _epoch_lambda_and_loss_kw(
     has_teacher_column: bool,
     base_loss_kwargs: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], float, bool, float]:
-    """Собирает loss_kwargs для начала эпохи (g0, 1-based = g0+1) soft/bayes-режима.
+    """Build loss_kwargs at epoch start (g0, 1-based = g0+1) for soft/bayes.
 
-    Возвращает (epoch_loss_kw, lambda_label_epoch, has_teacher_anchor, teacher_blend_w).
-    Используется вне hard-ветки.
+    Returns (epoch_loss_kw, lambda_label_epoch, has_teacher_anchor, teacher_blend_w).
+    Used outside the hard branch.
     """
     progress_epoch = _lambda_schedule_progress(
         g0, epochs, lambda_full_epochs, 0.0
@@ -387,9 +387,9 @@ def _validate_train_dpo_args(
     grad_clip_norm: float,
     optimizer_name: str,
 ) -> None:
-    """Валидация аргументов train_dpo. Единая точка отказа с понятным сообщением."""
+    """Validate train_dpo arguments. Single failure point with clear errors."""
     if mode not in DPO_MODE_CHOICES:
-        raise ValueError(f"mode должен быть один из {DPO_MODE_CHOICES}, получено: {mode!r}")
+        raise ValueError(f"mode must be one of {DPO_MODE_CHOICES}, got: {mode!r}")
     if not 0.0 <= lambda_min <= 1.0:
         raise ValueError(f"lambda_min must be in [0, 1], got {lambda_min!r}")
     if lambda_schedule not in ("linear", "cosine"):
@@ -525,24 +525,24 @@ def train_one_epoch_dpo(
     mid_epoch_hook: Optional[Callable[[int], None]] = None,
 ) -> int:
     """
-    Одна эпоха DPO. loss_fn(..., **loss_kw) возвращает (loss, kl_approx).
-    loss_kw изменяется in-place (например lambda_label после mid_epoch_hook).
+    One DPO epoch. loss_fn(..., **loss_kw) returns (loss, kl_approx).
+    loss_kw may be mutated in-place (e.g. lambda_label after mid_epoch_hook).
 
     train_loader_box:
-      - длиной 1 — единственный DataLoader на всю эпоху (mid_epoch_hook игнорируется);
-      - длиной 2 — [first_half_loader, second_half_placeholder]: цикл обходит первый
-        лоадер, потом один раз вызывает mid_epoch_hook(global_step) (который обязан
-        положить второй DataLoader в train_loader_box[1]), и дальше обходит второй.
-        Эта схема даёт эпохе 100%-ное покрытие (непересекающиеся выборки).
+      - length 1 — single DataLoader for the whole epoch (mid_epoch_hook ignored);
+      - length 2 — [first_half_loader, second_half_placeholder]: iterate the first
+        loader, call mid_epoch_hook(global_step) once (it must place the second
+        DataLoader in train_loader_box[1]), then iterate the second.
+        This gives 100% epoch coverage with disjoint samples.
 
-    epoch_1based: номер эпохи (1-based) только для строк лога train.
+    epoch_1based: 1-based epoch index for train log lines only.
     """
     policy_model.train()
     running_loss = 0.0
     running_kl = 0.0
     running_grad_abs_mean = 0.0
     log_interval = int(LOG_INTERVAL)
-    # Строка lr и агрегированные align-метрики с той же периодичностью (накопление за весь интервал).
+    # LR line and aggregated align metrics at the same cadence (accumulated over the interval).
     lr_align_log_interval = int(LR_ALIGN_LOG_INTERVAL)
     align_gap_parts: List[np.ndarray] = []
     align_ts_parts: List[np.ndarray] = []
@@ -638,7 +638,7 @@ def train_one_epoch_dpo(
     second_loader = train_loader_box[1]
     if second_loader is None:
         raise RuntimeError(
-            "mid_epoch_hook должен положить второй DataLoader в train_loader_box[1]"
+            "mid_epoch_hook must place the second DataLoader in train_loader_box[1]"
         )
     for batch in second_loader:
         process_batch(batch)
@@ -684,7 +684,7 @@ def train_dpo(
     val_entropy_max_prompts: int = VAL_ENTROPY_MAX_PROMPTS,
     val_entropy_num_samples: int = VAL_ENTROPY_NUM_SAMPLES,
     val_entropy_max_new_tokens: int = VAL_ENTROPY_MAX_NEW_TOKENS,
-    # Узкие дефолты под одну A100 80GB вместе с ref + KL_MC: шире — риск OOM на forward по полной длине.
+    # Conservative defaults for one A100 80GB with ref + KL_MC: larger values risk OOM on full-length forward.
     val_entropy_prompt_batch_size: int = VAL_ENTROPY_PROMPT_BATCH_SIZE,
     val_entropy_forward_chunk_size: int = VAL_ENTROPY_FORWARD_CHUNK_SIZE,
     val_distributions_max_batches: Optional[int] = None,
@@ -702,76 +702,74 @@ def train_dpo(
     optimizer_name: str = "AdamW",
 ):
     """
-    Универсальный цикл DPO: hard, soft или bayes.
+    Universal DPO loop: hard, soft, or bayes.
 
-    mode: "hard" — train и val в формате chosen/rejected, loss = hard_dpo_loss.
-          "soft" — train в формате resp1, resp2, p, p_bayes; val в формате chosen/rejected; train loss = soft_dpo_classic_loss(use_bayes=False).
-          "bayes" — как soft, но train loss = soft_dpo_classic_loss(use_bayes=True).
+    mode: "hard" — train/val chosen/rejected, loss = hard_dpo_loss.
+          "soft" — train resp1, resp2, p, p_bayes; val chosen/rejected; train loss = soft_dpo_classic_loss(use_bayes=False).
+          "bayes" — like soft, train loss = soft_dpo_classic_loss(use_bayes=True).
 
-    epochs: общее число эпох в плане (для λ и linear LR по шкале 1..epochs). Цикл обучения —
-        эпохи resume_start_epoch_1based, …, epochs (включительно). Старт с начала: resume_start_epoch_1based=1.
-    val_ds всегда в формате chosen/rejected; валидация по hard DPO loss, NLL, accuracy.
-    num_training_steps_override: для soft/bayes можно задать число шагов (например по hard train size) для выравнивания LR schedule.
-    lambda_min: для soft/bayes — нижняя граница lambda_label по эпохам (смешивание с p_pred); при 1.0 поведение как раньше.
-    lambda_full_epochs: для soft/bayes — k (1-based): эпохи 1..k только метки (λ=1); в конце эпохи k фиксируется
-        p_pred_teacher (σ(beta*diff) без T). С эпохи k+1 λ<1 сразу, по расписанию на хвосте (decay=epochs-k
-        эпох): progress первой хвостовой = 1/decay, последней = 1. Это согласовано по эпохам с режимом
-        lambda_full_epochs=0 (эпоха n при k=0 ≡ эпоха n при k>0 в смысле progress, если первую эпоху при
-        k=0 считать неявным warmup-по-меткам). Полезное следствие: при resume с
-        resume_start_epoch_1based == k+1 (загрузка весов конца эпохи k) λ<1 включается с первого шага
-        после загрузки — без лишней эпохи на λ=1. Пока в train_ds есть p_pred_teacher, в p_pred при λ<1
-        всегда w=0.5: 0.5*p_pred_teacher + 0.5*σ((beta*diff)/T).
-        0 — без warmup-анкора: расписание λ от первой эпохи, кэш p_pred_cached пересчитывается каждый шаг.
-    p_pred_target_temperature: T>0 для σ((beta*diff)/T) в якорном режиме (см. utils.losses.classic.soft_dpo_classic_loss); при lambda_full_epochs=0 не используется.
-    soft_loss_type: выбор train-loss для mode in {"soft","bayes"}:
+    epochs: planned epoch count (for λ and linear LR on scale 1..epochs). Training runs
+        resume_start_epoch_1based, …, epochs (inclusive). Fresh start: resume_start_epoch_1based=1.
+    val_ds is always chosen/rejected; validation uses hard DPO loss, NLL, accuracy.
+    num_training_steps_override: for soft/bayes, override step count (e.g. hard train size) to align LR schedule.
+    lambda_min: for soft/bayes, lower bound on lambda_label per epoch (blend with p_pred); 1.0 matches legacy behavior.
+    lambda_full_epochs: for soft/bayes, k (1-based): epochs 1..k labels only (λ=1); end of epoch k fixes
+        p_pred_teacher (σ(beta*diff) without T). From epoch k+1, λ<1 immediately on the tail schedule (decay=epochs-k
+        epochs): first tail progress = 1/decay, last = 1. Epoch alignment matches
+        lambda_full_epochs=0 (epoch n at k=0 ≡ epoch n at k>0 in progress if epoch 1 at
+        k=0 counts as implicit label warmup). Useful on resume with
+        resume_start_epoch_1based == k+1 (weights after epoch k): λ<1 from the first step
+        after load — no extra epoch at λ=1. While train_ds has p_pred_teacher, at λ<1
+        always w=0.5: 0.5*p_pred_teacher + 0.5*σ((beta*diff)/T).
+        0 — no warmup anchor: λ schedule from epoch 1, p_pred_cached recomputed every step.
+    p_pred_target_temperature: T>0 for σ((beta*diff)/T) in anchor mode (see utils.losses.classic.soft_dpo_classic_loss); unused if lambda_full_epochs=0.
+    soft_loss_type: train loss for mode in {"soft","bayes"}:
         "classic" -> soft_dpo_classic_loss,
         "approximation" -> soft_dpo_approximation_loss,
         "centered_softplus" -> soft_dpo_centered_softplus_loss.
-    seed: фиксирует shuffle train DataLoader (torch.Generator + num_workers=0).
-    label_noise_prob: вероятность шума меток при сборке soft train (--label-noise-prob); для hard не задаётся (в логе N/A).
-    use_chat_template: если True, get_logps использует tokenizer.apply_chat_template (Qwen-Instruct); иначе plain prompt\\nresponse (дефолт: config.base_config.USE_CHAT_TEMPLATE).
-    use_mlflow: логировать параметры, метрики и train.log в MLflow (tracking URI из mlflow_tracking_uri или окружения по умолчанию).
-    val_kl_mc_max_prompts: если >0 (по умолчанию DEFAULT_VAL_KL_MC_MAX_PROMPTS), в конце каждой эпохи считается MC-оценка KL(π‖ref) по сэмплам π_θ
-          на первых min(N, len(val)) промптах val (см. utils.metrics.estimate_val_kl_mc); лог: val_kl_mc, метрика MLflow при use_mlflow. 0 — отключить.
-    val_kl_mc_num_samples: число независимых генераций на промпт для MC.
-    val_entropy_max_prompts: если >0, в конце каждой эпохи считается средняя токенная энтропия ответов policy
-          по первым min(L, T_resp) токенам и агрегируется по prompt'ам; 0 — отключить.
-    val_entropy_num_samples: число независимых генераций на prompt для оценки энтропии.
-    val_entropy_max_new_tokens: L, ограничение на первые токены ответа для энтропии.
-    val_entropy_prompt_batch_size: сколько val-промптов за один generate (× num_samples параллельных цепочек).
-    val_entropy_forward_chunk_size: микробатч для полного forward по сгенерированным seq (снижает пик VRAM).
-    val_distributions_max_batches: если задано (>0), после основных val-метрик считаются распределения
-        delta_theta, delta_ref, diff на первых N батчах val; лог, MLflow, np.savez_compressed в output_dir.
-    capability_eval_dir: если задан (каталог с knowledge/*.jsonl и reasoning/*.jsonl), на каждой валидации
-        и в начале (epoch init) считается удержание возможностей: ref vs policy по gold; лог + JSON в output_dir;
-        ответы ref кэшируются после первой генерации. MLflow: val_cap_*.
-    capability_eval_limit: обрезка числа примеров (первые N в порядке файлов).
-    capability_eval_max_new_tokens / capability_eval_batch_size / capability_eval_max_prompt_tokens: генерация.
-    capability_ref_cache_path: путь к JSON-кэшу ref ответов для retention.
-        Если не задан, используется {capability_eval_dir}/ref_cache/<safe_model_name>_ref_texts.json.
-    resume_rewarmup_steps: при resume (g0_start>0) первые N шагов после возобновления ещё раз
-        плавно разгоняют lr (дополнительный множитель поверх основного расписания) — от
-        resume_rewarmup_lr_floor до 1.0 линейно. Оптимизатор пересоздаётся «с нуля» при
-        каждом resume (moments=0), поэтому полный lr на первом же шаге даёт большие
-        неустойчивые апдейты — этот ре-warmup сглаживает эффект. 0 отключает ре-warmup.
-    resume_rewarmup_lr_floor: минимальная доля lr в момент возобновления (0.0 — старт
-        буквально с нуля за N шагов; 0.05 — с 5% сразу).
-    grad_clip_norm: максимальная L2-норма градиента. 0 — без clip_grad_norm_ (дефолт).
-    optimizer_name: оптимизатор для policy_model: "AdamW" (дефолт) или "SGD".
-    resume_start_epoch_1based: первая эпоха этого запуска (1-based, как в логах и epochs/epoch_XXX).
-        Должно быть 1 <= resume_start_epoch_1based <= epochs. Веса из чекпоинта — после эпохи N-1
-        (например после epoch_003 задайте 4).         При N>1 первая валидация — полный val как после эпохи (N-1): тот же заголовок/теги,
-        что в конце эпохи; best_val_nll инициализируется этим NLL (склейка с предыдущим train.log).
-    resume_checkpoint_dir: путь к чекпоинту как при --resume (best или epochs/epoch_XXX); рядом ищется train.log.
-        При resume_start_epoch_1based>1 и непустом префиксе до эпохи S строки дописываются в начало train.log
-        в output_dir (перед логом текущего запуска).
-        Для soft/bayes с lambda_full_epochs=k>0: если resume_start_epoch_1based==k+1 (первый хвостовой шаг),
-        до цикла эпох вызывается precompute_p_pred_teacher по загруженным весам — как фиксация учителя
-        в конце эпохи k в непрерывном прогоне (при отсутствии столбца p_pred_teacher в train_ds).
-    Для soft/bayes и датасетов openbmb, ultrafeedback_binarized, ultrafeedback_soft, hh_rlhf при epochs>=2:
-        после первой половины батчей эпохи — валидация с меткой «0.5», «1.5», …; затем lambda_label
-        по расписанию для позиции k.5 (с учётом lambda_full_epochs) и при необходимости пересчёт p_pred_cached
-        для второй половины эпохи; в якорном режиме (p_pred_teacher) пересчёт кэша не делается.
+    seed: fixes train DataLoader shuffle (torch.Generator + num_workers=0).
+    label_noise_prob: label noise when building soft train (--label-noise-prob); not used for hard (log shows N/A).
+    use_chat_template: if True, get_logps uses tokenizer.apply_chat_template (Qwen-Instruct); else plain prompt\\nresponse (default: config.base_config.USE_CHAT_TEMPLATE).
+    use_mlflow: log params, metrics, and train.log to MLflow (URI from mlflow_tracking_uri or env default).
+    val_kl_mc_max_prompts: if >0 (default DEFAULT_VAL_KL_MC_MAX_PROMPTS), after each epoch val compute MC KL(π‖ref) from π_θ samples
+          on first min(N, len(val)) val prompts (see utils.metrics.estimate_val_kl_mc); log val_kl_mc, MLflow if use_mlflow. 0 disables.
+    val_kl_mc_num_samples: independent generations per prompt for MC.
+    val_entropy_max_prompts: if >0, after each epoch val compute mean per-token response entropy of policy
+          on first min(L, T_resp) tokens, aggregated over prompts; 0 disables.
+    val_entropy_num_samples: independent generations per prompt for entropy.
+    val_entropy_max_new_tokens: L, cap on first response tokens for entropy.
+    val_entropy_prompt_batch_size: val prompts per generate (× num_samples parallel chains).
+    val_entropy_forward_chunk_size: microbatch for full forward on generated seq (lowers VRAM peak).
+    val_distributions_max_batches: if set (>0), after main val metrics compute distributions
+        delta_theta, delta_ref, diff on first N val batches; log, MLflow, np.savez_compressed under output_dir.
+    capability_eval_dir: if set (dir with knowledge/*.jsonl and reasoning/*.jsonl), each validation
+        and at start (epoch init) run capability retention: ref vs policy on gold; log + JSON under output_dir;
+        ref answers cached after first generation. MLflow: val_cap_*.
+    capability_eval_limit: cap number of examples (first N in file order).
+    capability_eval_max_new_tokens / capability_eval_batch_size / capability_eval_max_prompt_tokens: generation knobs.
+    capability_ref_cache_path: path to JSON cache of ref answers for retention.
+        If unset, use {capability_eval_dir}/ref_cache/<safe_model_name>_ref_texts.json.
+    resume_rewarmup_steps: on resume (g0_start>0), first N steps after restart ramp
+        lr again (extra factor on top of main schedule) linearly from
+        resume_rewarmup_lr_floor to 1.0. Optimizer is recreated from scratch on each
+        resume (moments=0), so full lr on step 0 can be unstable — this re-warmup smooths it. 0 disables.
+    resume_rewarmup_lr_floor: minimum lr fraction at resume (0.0 — ramp from zero over N steps; 0.05 — start at 5%).
+    grad_clip_norm: max L2 grad norm. 0 — no clip_grad_norm_ (default).
+    optimizer_name: policy optimizer: "AdamW" (default) or "SGD".
+    resume_start_epoch_1based: first epoch of this run (1-based, as in logs and epochs/epoch_XXX).
+        Require 1 <= resume_start_epoch_1based <= epochs. Checkpoint weights are after epoch N-1
+        (e.g. after epoch_003 pass 4).         If N>1, first validation is full val as after epoch (N-1): same header/tags
+        as end-of-epoch; best_val_nll initialized from that NLL (stitched with prior train.log).
+    resume_checkpoint_dir: checkpoint path as in --resume (best or epochs/epoch_XXX); train.log is searched nearby.
+        If resume_start_epoch_1based>1 and a non-empty prefix through epoch S exists, lines are prepended to train.log
+        in output_dir (before this run's log).
+        For soft/bayes with lambda_full_epochs=k>0: if resume_start_epoch_1based==k+1 (first tail step),
+        precompute_p_pred_teacher runs on loaded weights before the epoch loop — same teacher fix
+        as end of epoch k in a continuous run (when train_ds lacks p_pred_teacher column).
+    For soft/bayes on openbmb, ultrafeedback_binarized, ultrafeedback_soft, hh_rlhf with epochs>=2:
+        after first half of epoch batches — validation tagged "0.5", "1.5", …; then lambda_label
+        on schedule for k.5 (with lambda_full_epochs) and optionally recompute p_pred_cached
+        for the second half; in anchor mode (p_pred_teacher) cache is not recomputed.
     """
     _validate_train_dpo_args(
         mode=mode,
@@ -814,15 +812,15 @@ def train_dpo(
                     )
                     if raw_lines and not prior_train_log_lines:
                         print(
-                            "train.log: не удалось вырезать историю до "
-                            f"эпохи {resume_start_epoch_1based} "
-                            f"({mode}: ожидается граница эпохи в логе) в {prior_train_log_src}; "
-                            "пропуск переноса.",
+                            "train.log: could not slice history up to "
+                            f"epoch {resume_start_epoch_1based} "
+                            f"({mode}: expected epoch boundary in log) at {prior_train_log_src}; "
+                            "skipping prefix transfer.",
                             file=sys.stderr,
                         )
                 except OSError as e:
                     print(
-                        f"train.log: не удалось прочитать {cand}: {e}",
+                        f"train.log: could not read {cand}: {e}",
                         file=sys.stderr,
                     )
 
@@ -834,13 +832,13 @@ def train_dpo(
     if prior_train_log_lines:
         sep = (
             f"\n--- train.log resumed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(epochs 1..{resume_start_epoch_1based - 1} из предыдущего train.log: {prior_train_log_src}) ---\n"
+            f"(epochs 1..{resume_start_epoch_1based - 1} from prior train.log: {prior_train_log_src}) ---\n"
         )
         with open(log_path, "w", encoding="utf-8") as wf:
             wf.writelines(prior_train_log_lines)
             wf.write(sep)
     else:
-        # Каждый новый запуск без resume-истории начинает train.log с чистого листа.
+        # Each fresh run without resume history starts train.log empty.
         with open(log_path, "w", encoding="utf-8"):
             pass
 
@@ -944,7 +942,7 @@ def train_dpo(
                         cap_rows = cap_rows[: int(capability_eval_limit)]
                     if not cap_rows:
                         log_msg(
-                            f"capability_eval_dir={eval_p}: примеры не найдены, retention пропущен."
+                            f"capability_eval_dir={eval_p}: no examples found, skipping retention."
                         )
                         cap_rows = None
                     else:
@@ -977,14 +975,14 @@ def train_dpo(
                                 f"Capability retention: ref cache miss at {cap_ref_cache_path_obj} [{reason}]"
                             )
                         log_msg(
-                            f"Capability retention: {len(cap_rows)} примеров из {eval_p} "
-                            f"(ref кэшируется после первой генерации)."
+                            f"Capability retention: {len(cap_rows)} examples from {eval_p} "
+                            f"(ref cached after first generation)."
                         )
                 except Exception as e:
-                    log_msg(f"Capability retention: ошибка загрузки eval: {e}")
+                    log_msg(f"Capability retention: eval load error: {e}")
                     cap_rows = None
             else:
-                log_msg(f"Capability retention: каталог не найден {eval_p}, пропуск.")
+                log_msg(f"Capability retention: directory not found {eval_p}, skipping.")
 
         def _epoch_tag_for_files(epoch_display: str) -> str:
             return epoch_display.replace(".", "_")
@@ -1012,7 +1010,7 @@ def train_dpo(
                     desc_pol=f"cap_ret policy [ep {epoch_display}]",
                 )
             except Exception as e:
-                log_msg(f"Capability retention: ошибка генерации/скоринга: {e}")
+                log_msg(f"Capability retention: generation/scoring error: {e}")
                 return
             if (
                 cap_ref_cache_path_obj is not None
@@ -1043,7 +1041,7 @@ def train_dpo(
                 with open(cap_json, "w", encoding="utf-8") as f:
                     json.dump(summary, f, ensure_ascii=False, indent=2)
             except OSError as err:
-                log_msg(f"Capability retention: не удалось записать {cap_json}: {err}")
+                log_msg(f"Capability retention: failed to write {cap_json}: {err}")
             if use_mlflow:
                 log_mlflow_capability_metrics(
                     summary,
@@ -1056,7 +1054,7 @@ def train_dpo(
             mlflow_step: Optional[int] = None,
             training_seconds: Optional[float] = None,
         ) -> float:
-            """epoch_display: '1', '0.5', '1.5', ... для логов и имён артефактов. Возвращает val NLL."""
+            """epoch_display: '1', '0.5', '1.5', ... for logs and artifact names. Returns val NLL."""
             tag = _epoch_tag_for_files(epoch_display)
             step_m = global_step if mlflow_step is None else mlflow_step
             t_validation_total_start = perf_counter()
@@ -1134,9 +1132,9 @@ def train_dpo(
                 and val_distributions_max_batches > 0
                 and len(val_ds) > 0
             ):
-                # Обёрнуто в try/except: это «nice to have» диагностика
-                # (распределения margin'ов), OOM/NaN здесь не должен валить
-                # всю эпоху — основные метрики уже посчитаны выше.
+                # Wrapped in try/except: nice-to-have diagnostics
+                # (margin distributions); OOM/NaN here must not kill
+                # the whole epoch — main metrics are already computed above.
                 try:
                     dist = compute_val_delta_distributions(
                         policy_model,
@@ -1225,8 +1223,8 @@ def train_dpo(
                         f"per_token={val_kl_mc_per_token:.6f} (total_tokens={n_tokens_mc})"
                     )
                     if use_mlflow:
-                        # per-seq оставляем под старым именем для совместимости графиков;
-                        # per-token — основная метрика для кросс-прогонного сравнения.
+                        # per-seq kept under legacy name for plot compatibility;
+                        # per-token is the primary metric for cross-run comparison.
                         mlflow.log_metric("val_kl_mc", val_kl_mc_per_seq, step=step_m)
                         mlflow.log_metric(
                             "val_kl_mc_per_seq", val_kl_mc_per_seq, step=step_m
@@ -1308,7 +1306,7 @@ def train_dpo(
             )
             timing_parts.append(f"validation_total={_fmt_seconds(validation_total_seconds)}")
             log_msg("timings: " + ", ".join(timing_parts))
-            # Пик на обучении логируется сразу после train_one_epoch_dpo (отдельная строка).
+            # Training VRAM peak is logged right after train_one_epoch_dpo (separate line).
             log_msg(f"gpu_mem_peak: validation={_fmt_mem_gb(validation_peak_mem_gb)}")
             log_msg("")
             return val_nll
@@ -1329,21 +1327,20 @@ def train_dpo(
         steps_per_schedule_epoch = max(1, num_training_steps // max(1, epochs))
         if num_training_steps % epochs != 0:
             log_msg(
-                "Предупреждение: num_training_steps не делится на epochs "
-                "нацело; стартовый сдвиг LR: "
+                "Warning: num_training_steps is not divisible by epochs "
+                "evenly; LR start offset: "
                 f"{g0_start} * floor({num_training_steps}/{epochs})."
             )
         start_global_step = g0_start * steps_per_schedule_epoch
         if start_global_step >= num_training_steps:
             raise ValueError(
-                f"resume_start_epoch_1based={resume_start_epoch_1based} даёт "
+                f"resume_start_epoch_1based={resume_start_epoch_1based} yields "
                 f"start_global_step={start_global_step} >= num_training_steps={num_training_steps}"
             )
 
-        # Явно логируем плановое и фактическое число шагов, чтобы LR-расписание
-        # визуально соответствовало реальной длине прогона (частая ловушка при
-        # num_training_steps_override по hard_train_size: если soft-train больше,
-        # scheduler уедет в lr=0 раньше конца обучения; если меньше — lr не дойдёт до 0).
+        # Log planned vs actual steps so the LR schedule matches real run length
+        # (common pitfall with num_training_steps_override from hard_train_size: if soft train is longer,
+        # scheduler hits lr=0 before training ends; if shorter, lr never reaches 0).
         steps_delta = total_actual_steps - num_training_steps
         steps_delta_pct = (
             100.0 * steps_delta / max(1, num_training_steps)
@@ -1359,14 +1356,14 @@ def train_dpo(
         )
         if steps_delta > 0:
             log_msg(
-                "Предупреждение: фактических шагов БОЛЬШЕ планового num_training_steps — "
-                f"последние {steps_delta} шагов пройдут с lr=0 (линейный спад уже достиг нуля)."
+                "Warning: actual steps exceed planned num_training_steps — "
+                f"last {steps_delta} steps run at lr=0 (linear decay already at zero)."
             )
         elif steps_delta < 0:
             final_lr_frac = 1.0 - (total_actual_steps / max(1, num_training_steps))
             log_msg(
-                "Предупреждение: фактических шагов МЕНЬШЕ планового num_training_steps — "
-                f"к концу прогона lr не опустится до нуля (останется ≈ {final_lr_frac:.2%} от lr max)."
+                "Warning: actual steps are below planned num_training_steps — "
+                f"by end of run lr will not reach zero (≈ {final_lr_frac:.2%} of max lr remains)."
             )
 
         if use_mlflow:
@@ -1385,7 +1382,7 @@ def train_dpo(
         _lnp = label_noise_prob if label_noise_prob is not None else "N/A"
         loss_log = soft_loss_type if mode in ("soft", "bayes") else mode
         log_msg(
-            f"Старт train_dpo: loss={loss_log}, epochs_total={epochs}, seed={seed}\n"
+            f"train_dpo start: loss={loss_log}, epochs_total={epochs}, seed={seed}\n"
             f"beta={beta}, lr={lr},\n"
             f"epochs_this_run={epochs - g0_start}, resume_start_epoch_1based={resume_start_epoch_1based}\n"
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
@@ -1405,8 +1402,8 @@ def train_dpo(
             "(max_prompts=0 disables response entropy after each epoch val)"
         )
 
-        # Начальная валидация: при --start-epoch>1 — как конец эпохи (start-1), полный val как после эпохи.
-        pre_val_epoch_done = g0_start  # завершённые эпохи 1..g0_start; веса = после эпохи pre_val_epoch_done
+        # Initial validation: with --start-epoch>1, like end of epoch (start-1), full val as after that epoch.
+        pre_val_epoch_done = g0_start  # completed epochs 1..g0_start; weights = after epoch pre_val_epoch_done
 
         checkpoint_val_nll: Optional[float] = None
         policy_model.eval()
@@ -1523,7 +1520,7 @@ def train_dpo(
             optimizer = torch.optim.SGD(
                 policy_model.parameters(), lr=lr, momentum=sgd_momentum
             )
-        else:  # защитный fallback; основной контроль — в _validate_train_dpo_args
+        else:  # defensive fallback; primary checks in _validate_train_dpo_args
             raise ValueError(
                 f"Unsupported optimizer_name={optimizer_name!r}; expected one of {OPTIMIZER_CHOICES}"
             )
@@ -1531,8 +1528,8 @@ def train_dpo(
         do_resume_rewarmup = start_global_step > 0 and resume_rewarmup_steps > 0
 
         def _lr_lambda(current_step: int) -> float:
-            # Основное расписание: линейный warmup до base_warmup_steps, затем линейный
-            # спад до 0 к num_training_steps — идентично get_linear_schedule_with_warmup.
+            # Main schedule: linear warmup to base_warmup_steps, then linear
+            # decay to 0 by num_training_steps — same as get_linear_schedule_with_warmup.
             if current_step < base_warmup_steps:
                 base = current_step / max(1, base_warmup_steps)
             else:
@@ -1540,11 +1537,11 @@ def train_dpo(
                     1, num_training_steps - base_warmup_steps
                 )
                 base = max(0.0, 1.0 - progress)
-            # Поверх основного — локальный ре-warmup: в течение первых
-            # resume_rewarmup_steps шагов после возобновления дополнительный
-            # множитель линейно растёт от resume_rewarmup_lr_floor до 1.0.
-            # Цель — дать AdamW собрать first/second moments без гигантских
-            # обновлений на первом же шаге (optimizer state не сохраняется).
+            # On top of main schedule — local re-warmup: for the first
+            # resume_rewarmup_steps after restart an extra factor ramps
+            # linearly from resume_rewarmup_lr_floor to 1.0.
+            # Lets AdamW rebuild first/second moments without huge
+            # updates on step 0 (optimizer state is not saved).
             if do_resume_rewarmup:
                 rel = current_step - start_global_step
                 if 0 <= rel < resume_rewarmup_steps:
@@ -1563,14 +1560,14 @@ def train_dpo(
 
         if do_resume_rewarmup:
             log_msg(
-                f"Resume rewarmup: первые {resume_rewarmup_steps} шагов после "
-                f"start_global_step={start_global_step} — дополнительный линейный "
-                f"множитель lr от {resume_rewarmup_lr_floor:g} до 1.0 поверх основного "
-                "расписания (компенсирует обнулённые moments AdamW при resume)."
+                f"Resume rewarmup: first {resume_rewarmup_steps} steps after "
+                f"start_global_step={start_global_step} — extra linear "
+                f"lr factor from {resume_rewarmup_lr_floor:g} to 1.0 on top of main "
+                "schedule (offsets zeroed AdamW moments on resume)."
             )
 
-        # Якорный режим: в непрерывном прогоне p_pred_teacher появляется в конце эпохи k (lambda_full_epochs).
-        # Старт с эпохи (k+1) без этого столбца — считаем учителя по текущим весам (конец эпохи k), как там же.
+        # Anchor mode: in a continuous run p_pred_teacher appears at end of epoch k (lambda_full_epochs).
+        # Starting epoch (k+1) without that column — compute teacher from current weights (end of k), same as there.
         if (
             mode != "hard"
             and lambda_full_epochs > 0
@@ -1599,10 +1596,10 @@ def train_dpo(
                 train_ds, train_collate, batch_size, g
             )
             log_msg(
-                f"p_pred_teacher: зафиксирован по загруженным весам "
+                f"p_pred_teacher: fixed from loaded weights "
                 f"(resume_start_epoch_1based={resume_start_epoch_1based} == lambda_full_epochs+1={lambda_full_epochs + 1}; "
-                f"эквивалентно концу эпохи {lambda_full_epochs} в непрерывном прогоне). "
-                f"Дальше как в непрерывном прогоне: на всех хвостовых эпохах (λ<1) "
+                f"equivalent to end of epoch {lambda_full_epochs} in a continuous run). "
+                f"As in continuous run: on all tail epochs (λ<1) "
                 f"p_pred = 0.5·p_teacher + 0.5·σ((β·diff)/T)."
             )
 
@@ -1659,15 +1656,15 @@ def train_dpo(
 
                 mid_hook = None
                 if use_mid_epoch_val and len(train_loader) >= 2:
-                    # Делим эпоху на две непересекающиеся половины по примерам:
-                    # генерируем одну пермутацию индексов train_ds, режем её в точке
-                    # first_count_examples = n_first_batches * batch_size, и дальше
-                    # перечисляем select(idx_first) и select(idx_second). Порядок
-                    # строк в train_ds сохраняется при add_column/remove_columns/map
-                    # в datasets, поэтому idx_second остаётся валидной выборкой
-                    # «оставшихся» примеров даже если mid_hook пересчитает
-                    # p_pred_cached. Итог: за эпоху каждый пример используется ровно
-                    # один раз, без пропусков и дубликатов.
+                    # Split the epoch into two disjoint halves by examples:
+                    # one permutation of train_ds indices, cut at
+                    # first_count_examples = n_first_batches * batch_size, then
+                    # select(idx_first) and select(idx_second). Row order
+                    # in train_ds is preserved across add_column/remove_columns/map
+                    # in datasets, so idx_second stays a valid sample of
+                    # remaining rows even if mid_hook recomputes
+                    # p_pred_cached. Result: each example used exactly once per epoch,
+                    # no skips or duplicates.
                     n_examples = len(train_ds)
                     perm_t = torch.randperm(n_examples, generator=g).tolist()
                     num_batches_total = (n_examples + batch_size - 1) // batch_size
@@ -1690,17 +1687,16 @@ def train_dpo(
                     def mid_hook(gs: int) -> None:
                         nonlocal train_ds, epoch_loss_kw
                         mid_epoch_display = f"{g0 + 0.5:.1f}"
-                        # Mid-epoch валидация — диагностика динамики, не критерий
-                        # save-best: падение здесь (OOM на KL_MC, сеть отвалилась
-                        # при cap-retention и т.п.) не должно ронять оставшиеся
-                        # полэпохи обучения. Ошибка логируется, обучение продолжается.
+                        # Mid-epoch validation — diagnostics, not save-best:
+                        # failures here (KL_MC OOM, network loss during cap-retention, etc.)
+                        # must not abort the remaining half-epoch. Log and continue training.
                         try:
                             _run_validation(mid_epoch_display, mlflow_step=gs)
                         except Exception as e:
                             log_msg(
                                 f"[epoch {mid_epoch_display}/{epochs}] mid-epoch validation FAILED "
-                                f"({type(e).__name__}: {e}); продолжаем вторую половину эпохи "
-                                "без mid-epoch метрик."
+                                f"({type(e).__name__}: {e}); continuing second half of epoch "
+                                "without mid-epoch metrics."
                             )
                         prog_m = _lambda_schedule_progress(
                             g0, epochs, lambda_full_epochs, 0.5
@@ -1775,13 +1771,12 @@ def train_dpo(
             training_seconds = perf_counter() - t_training_start
             training_peak_mem_gb = _gpu_peak_memory_gb(device)
             log_msg(f"gpu_mem_peak: training={_fmt_mem_gb(training_peak_mem_gb)}")
-            # В split-режиме train_loader_box держит две непересекающиеся половины
-            # текущей эпохи, поэтому забирать из него «основной» train_loader нельзя.
-            # Переменная train_loader будет пересоздана в начале следующей эпохи при
-            # любой ветке, которая реально по ней итерирует (precompute_p_pred_cached
-            # в начале эпохи или teacher_anchor-переход ниже), а до тех пор она
-            # используется только для оценки len(train_loader) (число батчей полного
-            # датасета), которое не меняется в mid_hook.
+            # In split mode train_loader_box holds two disjoint halves of the
+            # current epoch, so do not treat it as the main train_loader.
+            # train_loader is recreated at the next epoch start in any branch that
+            # actually iterates it (precompute_p_pred_cached at epoch start or
+            # teacher_anchor path below); until then it is only used for len(train_loader)
+            # (batch count of the full dataset), unchanged by mid_hook.
 
             if (
                 mode != "hard"
@@ -1810,8 +1805,8 @@ def train_dpo(
                     train_ds, train_collate, batch_size, g
                 )
                 log_msg(
-                    f"p_pred_teacher: зафиксирован в конце эпохи {g0 + 1} (1-based k={lambda_full_epochs}); "
-                    f"с эпохи {g0 + 2} λ<1 по расписанию; при λ<1 p_pred_teacher_blend=0.5 на всех хвостовых шагах."
+                    f"p_pred_teacher: fixed at end of epoch {g0 + 1} (1-based k={lambda_full_epochs}); "
+                    f"from epoch {g0 + 2} λ<1 on schedule; at λ<1 p_pred_teacher_blend=0.5 on all tail steps."
                 )
 
             policy_model.eval()
@@ -1840,7 +1835,8 @@ def train_dpo(
 
         run_finished_at = datetime.now()
         run_duration_sec = perf_counter() - run_started_perf
+        run_duration_hours = run_duration_sec / 3600.0
         log_msg("")
         log_msg(f"Run finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
         log_msg("Run status: SUCCESS")
-        log_msg(f"Run duration: {run_duration_sec:.1f}s")
+        log_msg(f"Run duration: {run_duration_hours:.2f}h")

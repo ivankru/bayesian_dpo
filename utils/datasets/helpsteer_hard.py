@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""HelpSteer3 (preference): hard DPO — пары с явным предпочтением (pref != 0)."""
+"""HelpSteer3 (preference): hard DPO — pairs with explicit preference (pref != 0)."""
 from typing import Dict, Any, Optional, List
 
 from datasets import load_dataset, Dataset
 
 
 def context_to_prompt(context: List[Dict[str, Any]]) -> str:
-    """Собирает строку промпта из списка сообщений {role, content} (HelpSteer3)."""
+    """Build prompt string from {role, content} messages (HelpSteer3)."""
     parts = []
     for turn in context:
         role = turn["role"]
@@ -17,7 +17,7 @@ def context_to_prompt(context: List[Dict[str, Any]]) -> str:
 
 def extract_pair_hard(example: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """
-    Один сэмпл HelpSteer3 → {prompt, chosen, rejected} или None при pref == 0.
+    One HelpSteer3 sample → {prompt, chosen, rejected} or None if pref == 0.
     """
     prompt = context_to_prompt(example["context"])
     a = example["response1"]
@@ -37,8 +37,8 @@ def extract_pair_hard(example: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 def build_val_hard(val_raw) -> Dataset:
     """
-    Val по HelpSteer3: только пары с явным предпочтением (pref != 0).
-    Используется в hard_dpo_steer и в soft_dpo_steer для одинакового val.
+    HelpSteer3 val: only pairs with explicit preference (pref != 0).
+    Shared by hard_dpo_steer and soft_dpo_steer for identical val.
     """
     val_processed = []
     for ex in val_raw:
@@ -49,7 +49,7 @@ def build_val_hard(val_raw) -> Dataset:
 
 
 def build_dpo_datasets():
-    """HelpSteer3 (preference): train и val только с явным предпочтением (pref != 0)."""
+    """HelpSteer3 (preference): train and val with explicit preference only (pref != 0)."""
     ds = load_dataset("nvidia/HelpSteer3", name="preference", streaming=False)
     train_raw = ds["train"]
     val_raw = ds["validation"]

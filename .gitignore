@@ -1,20 +1,20 @@
-# Не игнорировать каталоги (чтобы были видны .py в подпапках)
+# Do not ignore directories (so .py files in subfolders are visible)
 !*/
 
-# Игнорировать всё остальное
+# Ignore everything else
 *
 
-# Исключение: отслеживать .py файлы
+# Exception: track .py files
 !*.py
 
-# Локальный CLI capability retention не в репозитории (логика в utils/metrics/capability_retention_eval.py)
+# Local CLI capability retention not in repo (logic in utils/metrics/capability_retention_eval.py)
 /eval_capability_retention.py
 
-# Исключение: папка config (base_config и прочие .py)
+# Exception: config folder (base_config and other .py)
 !config/
 !config/*.py
 
-# Исключение: папка utils (содержит .py)
+# Exception: utils folder (contains .py)
 !utils/
 !utils/*.py
 !utils/metrics/
@@ -25,18 +25,18 @@
 !utils/losses/*.py
 !utils/seed.py
 
-# Исключение: сам .gitignore должен быть в репозитории
+# Exception: this .gitignore must be tracked
 !.gitignore
 
-# Папка чекпоинтов Jupyter
+# Jupyter checkpoints folder
 .ipynb_checkpoints/
 
-# Папки с результатами и данными
+# Folders with results and data
 alpaca2/
 ifeval2/
 checkpoints/
 
-# Локальные сценарии и тесты не коммитим (в конце файла: перекрывает !*.py для этих деревьев)
+# Do not commit local scripts and tests (at end of file: overrides !*.py for these trees)
 /scripts/
 /scripts/**
 /tests/

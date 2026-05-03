@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Загрузка и преобразование датасетов для DPO / soft-DPO.
-HelpSteer3, UltraFeedback (бинарный / score-soft), openbmb/UltraFeedback, PKU processed HH-RLHF.
+Load and transform datasets for DPO / soft-DPO.
+HelpSteer3, UltraFeedback (binary / score-soft), openbmb/UltraFeedback, PKU-processed HH-RLHF.
 """
 from .helpsteer_hard import build_dpo_datasets
 from .helpsteer_soft import build_helpsteer3_soft_datasets

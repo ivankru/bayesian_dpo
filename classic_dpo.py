@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Классический DPO через TRL (DPOTrainer). Те же входные параметры, что у hard_dpo_steer.
-На валидации логируются те же метрики: NLL, acc, KL (и DPO loss), как в hard_dpo_steer.
+Classic DPO via TRL (DPOTrainer). Same CLI-style inputs as hard_dpo_steer.
+Validation logs the same metrics: NLL, acc, KL (and DPO loss) as hard_dpo_steer.
 """
 import json
 import math
@@ -97,7 +97,7 @@ def _classic_capability_retention(
             desc_pol=f"cap_ret policy ep{epoch_display}",
         )
     except Exception as e:
-        log_fn(f"Capability retention: ошибка: {e}")
+        log_fn(f"Capability retention: error: {e}")
         return
     for line in format_capability_retention_log_lines(summary, epoch_display):
         log_fn(line)
@@ -109,7 +109,7 @@ def _classic_capability_retention(
         with open(cap_json, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
     except OSError as err:
-        log_fn(f"Capability retention: не удалось записать {cap_json}: {err}")
+        log_fn(f"Capability retention: failed to write {cap_json}: {err}")
 
 
 def _classic_log_val_kl_mc(
@@ -239,7 +239,7 @@ def _classic_log_val_response_entropy(
 
 
 class DPOValidationMetricsCallback(TrainerCallback):
-    """После каждой эпохи валидации пишет в log те же метрики, что и hard_dpo_steer: NLL, acc, KL, DPO loss."""
+    """After each validation epoch, logs the same metrics as hard_dpo_steer: NLL, acc, KL, DPO loss."""
 
     def __init__(
         self,
@@ -406,29 +406,29 @@ def main(
     val_entropy_forward_chunk_size: int = VAL_ENTROPY_FORWARD_CHUNK_SIZE,
 ):
     """
-    resume_from: путь к чекпоинту для продолжения обучения.
-    seed, output_dir, dataset, base_model, batch_size, grad_accum_steps, epochs, lr, beta — по смыслу как в hard_dpo_steer.
-    Обучение — классический DPO из библиотеки TRL (DPOTrainer).
+    resume_from: checkpoint path to resume training from.
+    seed, output_dir, dataset, base_model, batch_size, grad_accum_steps, epochs, lr, beta — same meaning as in hard_dpo_steer.
+    Training uses classic DPO from TRL (DPOTrainer).
     """
     if dataset not in DATASET_CHOICES:
-        raise ValueError(f"dataset должен быть один из {DATASET_CHOICES}, получено: {dataset!r}")
+        raise ValueError(f"dataset must be one of {DATASET_CHOICES}, got: {dataset!r}")
     set_seed(seed)
     if dataset == "helpsteer3":
-        print("Загружаю HelpSteer3-Preference...")
+        print("Loading HelpSteer3-Preference...")
         train_ds, val_ds = build_dpo_datasets()
     else:
-        print("Загружаю UltraFeedback Binarized...")
+        print("Loading UltraFeedback Binarized...")
         train_ds, val_ds = build_dpo_datasets_ultrafeedback()
     model_name = BASE_MODEL_CHOICES[base_model]
     print(f"Model: {model_name}, Dataset: {dataset}, train size: {len(train_ds)}, val size: {len(val_ds)}")
     if resume_from:
-        print(f"Загружаю модель из чекпоинта: {resume_from} (база {model_name})")
+        print(f"Loading model from checkpoint: {resume_from} (base {model_name})")
     else:
-        print(f"Загружаю модель и токенайзер: {model_name} (LoRA)")
+        print(f"Loading model and tokenizer: {model_name} (LoRA)")
     if grad_accum_steps < 1:
-        raise ValueError(f"grad_accum_steps должен быть >= 1, получено: {grad_accum_steps}")
+        raise ValueError(f"grad_accum_steps must be >= 1, got: {grad_accum_steps}")
     if epochs < 1:
-        raise ValueError(f"epochs должен быть >= 1, получено: {epochs}")
+        raise ValueError(f"epochs must be >= 1, got: {epochs}")
 
     tokenizer, policy_model, ref_model, device = load_models_and_tokenizer(
         model_name,
@@ -447,13 +447,13 @@ def main(
     log_path = os.path.join(output_dir, "train.log")
     run_started_at = datetime.now()
     run_started_perf = time.perf_counter()
-    # Каждый новый запуск начинает train.log с чистого листа.
+    # Each new run starts train.log from scratch.
     with open(log_path, "w", encoding="utf-8"):
         pass
 
     def log_fn(msg: str) -> None:
-        # Лог-строки идут в stdout, чтобы не смешиваться с tqdm-прогрессами (stderr).
-        # Это даёт чистое `>run.log` с только осмысленными строками.
+        # Log lines go to stdout so they do not mix with tqdm progress (stderr).
+        # Yields a clean `>run.log` with only meaningful lines.
         print(msg, flush=True, file=sys.stdout)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
@@ -513,14 +513,14 @@ def main(
                 if loaded:
                     cap_rows = loaded
                     log_fn(
-                        f"Capability retention: {len(cap_rows)} примеров из {ep} "
-                        f"(ref кэшируется после первой генерации)."
+                        f"Capability retention: {len(cap_rows)} examples from {ep} "
+                        f"(ref cached after first generation)."
                     )
         except Exception as e:
-            log_fn(f"Capability retention: ошибка загрузки eval: {e}")
+            log_fn(f"Capability retention: eval load error: {e}")
             cap_rows = None
 
-    # Начальная валидация — те же метрики, что в hard_dpo_steer
+    # Initial validation — same metrics as hard_dpo_steer
     val_loader_init = DataLoader(
         val_ds,
         batch_size=training_args.per_device_eval_batch_size,
@@ -618,90 +618,91 @@ def main(
         os.makedirs(best_ckpt, exist_ok=True)
         trainer.save_model(best_ckpt)
         tokenizer.save_pretrained(best_ckpt)
-        log_fn(f"Checkpoint сохранён: {best_ckpt}")
+        log_fn(f"Checkpoint saved: {best_ckpt}")
     except Exception as exc:
         run_status = f"FAILED: {exc}"
         raise
     finally:
         run_finished_at = datetime.now()
         run_duration_sec = time.perf_counter() - run_started_perf
+        run_duration_hours = run_duration_sec / 3600.0
         log_fn("")
         log_fn(f"Run finished at: {run_finished_at.strftime('%Y-%m-%d %H:%M:%S')}")
         log_fn(f"Run status: {run_status}")
-        log_fn(f"Run duration: {run_duration_sec:.1f}s")
+        log_fn(f"Run duration: {run_duration_hours:.2f}h")
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Классический DPO (TRL) на HelpSteer3 / UltraFeedback")
+    parser = argparse.ArgumentParser(description="Classic DPO (TRL) on HelpSteer3 / UltraFeedback")
     parser.add_argument(
         "--resume", "-r",
         type=str,
         default=None,
-        help="Путь к чекпоинту для продолжения обучения (например checkpoints/classic_dpo/best)",
+        help="Checkpoint path to resume from (e.g. checkpoints/classic_dpo/best)",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Seed для воспроизводимости (по умолчанию 42)")
-    parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/classic_dpo", help="Папка для чекпоинтов и train.log")
-    parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Датасет: helpsteer3 или ultrafeedback_binarized")
-    parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Базовая модель: 3b или 7b.")
-    parser.add_argument("--batch-size", "-b", type=int, default=8, help="Размер батча для train и validation (по умолчанию: 8).")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility (default: 42)")
+    parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/classic_dpo", help="Directory for checkpoints and train.log")
+    parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Dataset: helpsteer3 or ultrafeedback_binarized")
+    parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Base model: 3b or 7b.")
+    parser.add_argument("--batch-size", "-b", type=int, default=8, help="Batch size for train and validation (default: 8).")
     parser.add_argument(
         "--grad-accum-steps",
         type=int,
         default=1,
-        help="Шаги накопления градиента (effective_batch = batch_size * grad_accum_steps).",
+        help="Gradient accumulation steps (effective_batch = batch_size * grad_accum_steps).",
     )
-    parser.add_argument("--epochs", type=int, default=3, help="Количество эпох обучения (по умолчанию: 3).")
-    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (по умолчанию: 2e-5).")
-    parser.add_argument("--beta", type=float, default=0.2, help="Параметр beta для DPO loss (по умолчанию: 0.2).")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs (default: 3).")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5).")
+    parser.add_argument("--beta", type=float, default=0.2, help="Beta parameter for DPO loss (default: 0.2).")
     parser.add_argument(
         "--use-separate-ref-model",
         action="store_true",
         help=(
-            "Загрузить отдельную reference-модель (старое поведение; требует больше VRAM). "
-            "По умолчанию ref в DPOTrainer берётся без второй копии модели."
+            "Load a separate reference model (legacy behavior; needs more VRAM). "
+            "By default DPOTrainer uses ref without a second full model copy."
         ),
     )
     parser.add_argument(
         "--capability-eval-dir",
         type=str,
         default=None,
-        help="Каталог eval_datasets: на каждой валидации лог capability retention.",
+        help="eval_datasets directory: log capability retention on each validation.",
     )
     parser.add_argument(
         "--use-chat-template",
         action="store_true",
         default=USE_CHAT_TEMPLATE,
-        help=f"Считать log p через apply_chat_template (по умолчанию: {USE_CHAT_TEMPLATE}).",
+        help=f"Compute log p via apply_chat_template (default: {USE_CHAT_TEMPLATE}).",
     )
     parser.add_argument(
         "--val-kl-mc-max-prompts",
         type=int,
         default=DEFAULT_VAL_KL_MC_MAX_PROMPTS,
         help=(
-            "MC-оценка forward KL(pi||ref) на val: первые N промптов; "
-            f"0 — отключить (по умолчанию {DEFAULT_VAL_KL_MC_MAX_PROMPTS})."
+            "MC estimate of forward KL(pi||ref) on val: first N prompts; "
+            f"0 disables (default {DEFAULT_VAL_KL_MC_MAX_PROMPTS})."
         ),
     )
     parser.add_argument(
         "--val-kl-mc-num-samples",
         type=int,
         default=VAL_KL_MC_NUM_SAMPLES,
-        help=f"Число генераций на промпт для MC-KL (по умолчанию {VAL_KL_MC_NUM_SAMPLES}).",
+        help=f"Generations per prompt for MC-KL (default {VAL_KL_MC_NUM_SAMPLES}).",
     )
     parser.add_argument(
         "--val-kl-mc-max-new-tokens",
         type=int,
         default=128,
-        help="Максимум новых токенов в одной генерации для MC-KL (по умолчанию 128).",
+        help="Max new tokens per generation for MC-KL (default 128).",
     )
     parser.add_argument(
         "--val-kl-mc-prompt-batch-size",
         type=int,
         default=VAL_KL_MC_PROMPT_BATCH_SIZE,
         help=(
-            "Батч промптов при генерации/оценке MC-KL "
-            f"(по умолчанию {VAL_KL_MC_PROMPT_BATCH_SIZE})."
+            "Prompt batch size during MC-KL generation/evaluation "
+            f"(default {VAL_KL_MC_PROMPT_BATCH_SIZE})."
         ),
     )
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-# Среда для bayesian_dpo: DPO, AlpacaEval
+# Environment for bayesian_dpo: DPO, AlpacaEval
 # Python >= 3.10
 
 torch>=2.5.1
@@ -11,10 +11,10 @@ tqdm
 scikit-learn>=1.3.2
 mlflow>=2.8.0
 
-# Опционально, для официального alpaca_eval (--alpaca-eval-lib):
+# Optional, for official alpaca_eval (--alpaca-eval-lib):
 # alpaca-eval>=0.6.6
 
-# Опционально, для ifeval_run.py (Google IFEval, скачиваемый в ~/.cache/soft_dpo/ifeval/):
+# Optional, for ifeval_run.py (Google IFEval, downloaded to ~/.cache/soft_dpo/ifeval/):
 # absl-py>=1.0.0
 # langdetect>=1.0.9
 # nltk>=3.8.1

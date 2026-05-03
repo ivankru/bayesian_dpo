@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Метрики DPO, alignment по anchor, capability retention."""
+"""DPO metrics, anchor alignment, capability retention."""
 
 from .anchor_alignment import aggregate_anchor_alignment_window, format_anchor_alignment_log
 from .capability_retention_eval import (

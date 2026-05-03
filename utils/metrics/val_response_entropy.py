@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Оценка энтропии токенов ответов policy на валидационных промптах.
+Token-level response entropy of the policy on validation prompts.
 
-Метрика считает H_t = -sum_v p_t(v) log p_t(v) по logits генерации и агрегирует:
-- по токенам ответа (с ограничением на первые L токенов),
-- по K сэмплам для каждого prompt,
-- по множеству prompt'ов (mean / median / p10 / p90 / std).
+Computes H_t = -sum_v p_t(v) log p_t(v) from generation logits and aggregates:
+- over response tokens (capped at first L tokens),
+- over K samples per prompt,
+- over prompts (mean / median / p10 / p90 / std).
 """
 from typing import Dict, List, Sequence
 
@@ -17,8 +17,8 @@ from tqdm import tqdm
 
 def _response_token_mask(gen_tail: torch.Tensor, eos_id) -> torch.Tensor:
     """
-    [B, T] — True для токенов ответа, входящих в среднее (до первого EOS включительно;
-    если EOS в префиксе из T токенов нет — все T позиций).
+    [B, T] — True for response tokens included in the mean (through first EOS inclusive;
+    if no EOS in the T-token prefix — all T positions).
     """
     b, t = gen_tail.shape
     if eos_id is None:
@@ -39,7 +39,7 @@ def _response_token_mask(gen_tail: torch.Tensor, eos_id) -> torch.Tensor:
 
 
 def _effective_tokenizer_cap(tokenizer) -> int:
-    """Безопасный cap для tokenizer.model_max_length."""
+    """Safe cap for tokenizer.model_max_length."""
     cap = getattr(tokenizer, "model_max_length", None)
     if cap is None or cap <= 0 or cap > 1_000_000:
         cap = 8192
@@ -64,10 +64,10 @@ def estimate_val_response_entropy(
     show_progress: bool = True,
 ) -> Dict[str, float]:
     """
-    Возвращает статистики распределения mean-token-entropy по prompt'ам.
+    Stats of mean-token-entropy distribution across prompts.
 
-    Для каждого prompt генерируется K ответов, для каждого ответа считается средняя
-    энтропия по первым min(L, T_resp) токенам, затем среднее по K.
+    For each prompt, generate K completions; per completion average entropy
+    over the first min(L, T_resp) tokens, then mean over K.
     """
     if num_samples_per_prompt < 1:
         raise ValueError(
@@ -102,9 +102,9 @@ def estimate_val_response_entropy(
 
     cap_enc = _effective_tokenizer_cap(tokenizer)
 
-    # Не используем output_scores: на части связок (Peft + Qwen + device_map / конфиг generate)
-    # `generated.scores` приходит пустым, и метрика превращается в NaN. Энтропию считаем по одному
-    # forward на полной сгенерированной последовательности (logits[t] предсказывает token[t+1]).
+    # Do not use output_scores: for some stacks (Peft + Qwen + device_map / generate config)
+    # `generated.scores` is empty and the metric becomes NaN. Compute entropy with one
+    # forward on the full generated sequence (logits[t] predicts token[t+1]).
     gen_kwargs = {
         "max_new_tokens": int(max_new_tokens),
         "pad_token_id": tokenizer.pad_token_id,
@@ -191,7 +191,7 @@ def estimate_val_response_entropy(
                         input_ids=sub,
                         attention_mask=sub_attn,
                     ).logits.float()
-                    # logits[b, pos] -> token[b, pos+1]; первый новый токен в pos=in_len
+                    # logits[b, pos] -> token[b, pos+1]; first new token at pos=in_len
                     slice_logits = logits[:, in_len - 1 : in_len - 1 + limit, :]
                     if temperature is not None and float(temperature) > 0:
                         slice_logits = slice_logits / float(temperature)
