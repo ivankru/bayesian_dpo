@@ -309,7 +309,13 @@ class DPOValidationMetricsCallback(TrainerCallback):
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="val DPO metrics", leave=False):
                 loss, kl_b = hard_dpo_loss(
-                    batch, self.tokenizer, model, self.ref_model, self.device, beta=self.beta
+                    batch,
+                    self.tokenizer,
+                    model,
+                    self.ref_model,
+                    self.device,
+                    beta=self.beta,
+                    use_chat_template=self._use_chat_template,
                 )
                 n = len(batch["prompt"])
                 val_dpo_sum += loss.item() * n
@@ -477,9 +483,12 @@ def main(
         max_prompt_length=MAX_PROMPT_LEN,
         remove_unused_columns=False,
         beta=beta,
+        seed=seed,
+        data_seed=seed,
     )
 
     log_fn("=== Classic DPO (TRL DPOTrainer) ===")
+    log_fn(f"seed={seed} (set_seed + DPOConfig seed/data_seed)")
     log_fn(f"Model: {model_name}, Dataset: {dataset}, train size: {len(train_ds)}, val size: {len(val_ds)}")
     log_fn(
         f"beta={beta}, lr={lr}, batch_size={batch_size}, "
@@ -535,7 +544,15 @@ def main(
     init_n = 0
     with torch.no_grad():
         for batch in tqdm(val_loader_init, desc="init DPO loss", leave=False):
-            loss, kl_b = hard_dpo_loss(batch, tokenizer, policy_model, ref_model, device, beta=beta)
+            loss, kl_b = hard_dpo_loss(
+                batch,
+                tokenizer,
+                policy_model,
+                ref_model,
+                device,
+                beta=beta,
+                use_chat_template=use_chat_template,
+            )
             n = len(batch["prompt"])
             init_dpo_sum += loss.item() * n
             init_kl_sum += kl_b * n
@@ -671,7 +688,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use-chat-template",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=USE_CHAT_TEMPLATE,
         help=f"Compute log p via apply_chat_template (default: {USE_CHAT_TEMPLATE}).",
     )
