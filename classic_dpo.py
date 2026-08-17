@@ -52,6 +52,7 @@ from utils.metrics import (
 )
 from utils.models import load_models_and_tokenizer
 from utils.training import DEFAULT_VAL_KL_MC_MAX_PROMPTS, collate_fn_hard
+from utils.val_distributions import log_val_diff_from_loader
 
 
 # ======================
@@ -308,7 +309,7 @@ class DPOValidationMetricsCallback(TrainerCallback):
         val_n = 0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="val DPO metrics", leave=False):
-                loss, kl_b = hard_dpo_loss(
+                loss, kl_b, *_ = hard_dpo_loss(
                     batch,
                     self.tokenizer,
                     model,
@@ -340,6 +341,15 @@ class DPOValidationMetricsCallback(TrainerCallback):
         self.log_fn(f"validation logp_gap_mean : {val_kl:.4f}")
         self.log_fn(f"validation pair NLL   : {val_nll:.4f}")
         self.log_fn(f"validation pair acc   : {100 * val_acc:.2f}%")
+        log_val_diff_from_loader(
+            model,
+            self.ref_model,
+            self.tokenizer,
+            val_loader,
+            self.device,
+            self.log_fn,
+            use_chat_template=self._use_chat_template,
+        )
         _classic_log_val_kl_mc(
             self.val_ds,
             self.tokenizer,
@@ -544,7 +554,7 @@ def main(
     init_n = 0
     with torch.no_grad():
         for batch in tqdm(val_loader_init, desc="init DPO loss", leave=False):
-            loss, kl_b = hard_dpo_loss(
+            loss, kl_b, *_ = hard_dpo_loss(
                 batch,
                 tokenizer,
                 policy_model,
@@ -575,6 +585,15 @@ def main(
     log_fn(f"validation logp_gap_mean : {init_kl:.4f}")
     log_fn(f"validation pair NLL   : {init_nll:.4f}")
     log_fn(f"validation pair acc   : {100 * init_acc:.2f}%")
+    log_val_diff_from_loader(
+        policy_model,
+        ref_model,
+        tokenizer,
+        val_loader_init,
+        device,
+        log_fn,
+        use_chat_template=use_chat_template,
+    )
     _classic_capability_retention(
         cap_rows,
         cap_ref_holder,

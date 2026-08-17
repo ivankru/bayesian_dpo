@@ -70,11 +70,19 @@ def _build_soft_targets(
 
 
 def _build_soft_diag(
-    batch: dict[str, Any], *, p_gt: torch.Tensor, p_target: torch.Tensor, device: str
+    batch: dict[str, Any],
+    *,
+    p_gt: torch.Tensor,
+    p_target: torch.Tensor,
+    diff: torch.Tensor,
+    device: str,
 ) -> dict[str, Any]:
     with torch.no_grad():
         ts = (p_target.detach() - p_gt.detach()).abs().float().cpu().numpy()
-        diag: dict[str, Any] = {"target_shift": ts}
+        diag: dict[str, Any] = {
+            "target_shift": ts,
+            "diff": diff.detach().float().cpu().numpy(),
+        }
         if "p_pred_teacher" in batch:
             pp = torch.as_tensor(
                 batch["p_pred_teacher"], dtype=torch.float32, device=device
@@ -138,5 +146,7 @@ def _compute_soft_loss_common(
     loss_per_example = per_example_loss_fn(diff, logit, p_target, beta)
     loss = loss_per_example.mean()
     kl = _kl_approx(logp_1, logp_2, logp_1_ref, logp_2_ref)
-    diag = _build_soft_diag(batch, p_gt=p_gt, p_target=p_target, device=device)
+    diag = _build_soft_diag(
+        batch, p_gt=p_gt, p_target=p_target, diff=diff, device=device
+    )
     return loss, kl, diag

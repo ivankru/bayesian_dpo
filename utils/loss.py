@@ -126,7 +126,7 @@ def hard_dpo_loss(
 ):
     """
     Hard DPO: batch with fields prompt, chosen, rejected.
-    Returns (loss, kl_approx).
+    Returns (loss, kl_approx, diag) where diag contains per-example DPO margin diff.
     """
     prompts = batch["prompt"]
     chosen = batch["chosen"]
@@ -144,7 +144,9 @@ def hard_dpo_loss(
     kl_approx = 0.5 * (
         (logp_c - logp_c_ref).mean().item() + (logp_r - logp_r_ref).mean().item()
     )
-    return loss, kl_approx
+    with torch.no_grad():
+        diag = {"diff": diff.detach().float().cpu().numpy()}
+    return loss, kl_approx, diag
 
 
 def soft_dpo_loss(
@@ -255,7 +257,10 @@ def soft_dpo_loss(
 
     with torch.no_grad():
         ts = (p_target.detach() - p_gt.detach()).abs().float().cpu().numpy()
-        diag: dict = {"target_shift": ts}
+        diag: dict = {
+            "target_shift": ts,
+            "diff": diff.detach().float().cpu().numpy(),
+        }
         # gap_abs — pure diagnostic |p_gt - p_pred_*| (teacher or cached),
         # independent of lambda_label. Useful even at λ=1 (warmup epochs after
         # teacher fix): shows how far the teacher drifts from labels.
@@ -361,7 +366,10 @@ def soft_dpo_loss_alt(
 
     with torch.no_grad():
         ts = (p_target.detach() - p_gt.detach()).abs().float().cpu().numpy()
-        diag: dict = {"target_shift": ts}
+        diag: dict = {
+            "target_shift": ts,
+            "diff": diff.detach().float().cpu().numpy(),
+        }
         if "p_pred_teacher" in batch:
             pp = torch.as_tensor(
                 batch["p_pred_teacher"], dtype=torch.float32, device=device
@@ -456,7 +464,10 @@ def soft_dpo_loss_alt_centered(
 
     with torch.no_grad():
         ts = (p_target.detach() - p_gt.detach()).abs().float().cpu().numpy()
-        diag: dict = {"target_shift": ts}
+        diag: dict = {
+            "target_shift": ts,
+            "diff": diff.detach().float().cpu().numpy(),
+        }
         if "p_pred_teacher" in batch:
             pp = torch.as_tensor(
                 batch["p_pred_teacher"], dtype=torch.float32, device=device

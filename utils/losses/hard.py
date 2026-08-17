@@ -18,7 +18,7 @@ def hard_dpo_loss(
 ):
     """
     Hard DPO: batch with fields prompt, chosen, rejected.
-    Returns (loss, kl_approx).
+    Returns (loss, kl_approx, diag) where diag contains per-example DPO margin diff.
     """
     prompts = batch["prompt"]
     chosen = batch["chosen"]
@@ -36,4 +36,6 @@ def hard_dpo_loss(
     kl_approx = 0.5 * (
         (logp_c - logp_c_ref).mean().item() + (logp_r - logp_r_ref).mean().item()
     )
-    return loss, kl_approx
+    with torch.no_grad():
+        diag = {"diff": diff.detach().float().cpu().numpy()}
+    return loss, kl_approx, diag

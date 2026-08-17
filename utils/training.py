@@ -58,7 +58,12 @@ from utils.metrics import (
     run_retention_eval_pair,
     save_ref_texts_cache,
 )
-from utils.val_distributions import compute_val_delta_distributions
+from utils.val_distributions import (
+    compute_val_delta_distributions,
+    log_train_diff_stats,
+    log_val_diff_from_loader,
+    summarize_margin,
+)
 
 DPO_MODE_CHOICES = ("hard", "soft", "bayes")
 OPTIMIZER_CHOICES = ("adamw", "sgd")
@@ -541,11 +546,13 @@ def train_one_epoch_dpo(
     running_loss = 0.0
     running_kl = 0.0
     running_grad_abs_mean = 0.0
+    running_grad_norm = 0.0
     log_interval = int(LOG_INTERVAL)
     # LR line and aggregated align metrics at the same cadence (accumulated over the interval).
     lr_align_log_interval = int(LR_ALIGN_LOG_INTERVAL)
     align_gap_parts: List[np.ndarray] = []
     align_ts_parts: List[np.ndarray] = []
+    train_diff_parts: List[np.ndarray] = []
 
     def flush_align_log() -> None:
         if not align_ts_parts:
@@ -560,7 +567,7 @@ def train_one_epoch_dpo(
         align_ts_parts.clear()
 
     def process_batch(batch) -> None:
-        nonlocal global_step, running_loss, running_kl, running_grad_abs_mean
+        nonlocal global_step, running_loss, running_kl, running_grad_abs_mean, running_grad_norm
         optimizer.zero_grad(set_to_none=True)
         out = loss_fn(batch, tokenizer, policy_model, ref_model, device, **loss_kw)
         if len(out) == 3:
@@ -572,18 +579,26 @@ def train_one_epoch_dpo(
                 ga = soft_diag.get("gap_abs")
                 if ga is not None and ga.size:
                     align_gap_parts.append(ga)
+                diff_arr = soft_diag.get("diff")
+                if diff_arr is not None and np.asarray(diff_arr).size:
+                    train_diff_parts.append(np.asarray(diff_arr, dtype=np.float64))
         else:
             loss, kl_batch = out
         loss.backward()
+        # Trainable grads only (frozen base has grad=None). Same L2 as TRL train/grad_norm:
+        # ||∇_θ L||_2 = sqrt(Σ_j a_j^2), a = ∇_θ L. Measured before clip_grad_norm_.
         grad_abs_sum = 0.0
+        grad_sq_sum = 0.0
         grad_numel = 0
         for p in policy_model.parameters():
             if p.grad is None:
                 continue
             g = p.grad.detach()
             grad_abs_sum += g.abs().sum().item()
+            grad_sq_sum += g.pow(2).sum().item()
             grad_numel += g.numel()
         grad_abs_mean = grad_abs_sum / max(1, grad_numel)
+        grad_norm = math.sqrt(grad_sq_sum)
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 policy_model.parameters(), grad_clip_norm
@@ -594,6 +609,7 @@ def train_one_epoch_dpo(
         running_loss += loss.item()
         running_kl += kl_batch
         running_grad_abs_mean += grad_abs_mean
+        running_grad_norm += grad_norm
         global_step += 1
 
         if global_step % lr_align_log_interval == 0:
@@ -608,7 +624,8 @@ def train_one_epoch_dpo(
                 f"[epoch {epoch_1based} step {global_step}] "
                 f"loss={running_loss / n:.4f} "
                 f"logp_gap_mean={running_kl / n:.4f} "
-                f"grad_abs_mean={running_grad_abs_mean / n:.6e}"
+                f"grad_abs_mean={running_grad_abs_mean / n:.6e} "
+                f"grad_norm={running_grad_norm / n:.6e}"
             )
             if use_mlflow:
                 mlflow.log_metric("loss", running_loss / n, step=global_step)
@@ -616,9 +633,13 @@ def train_one_epoch_dpo(
                 mlflow.log_metric(
                     "grad_abs_mean", running_grad_abs_mean / n, step=global_step
                 )
+                mlflow.log_metric(
+                    "grad_norm", running_grad_norm / n, step=global_step
+                )
             running_loss = 0.0
             running_kl = 0.0
             running_grad_abs_mean = 0.0
+            running_grad_norm = 0.0
 
     split_mid = mid_epoch_hook is not None and len(train_loader_box) == 2
 
@@ -627,23 +648,35 @@ def train_one_epoch_dpo(
         for batch in loader:
             process_batch(batch)
         flush_align_log()
-        return global_step
+    else:
+        first_loader = train_loader_box[0]
+        for batch in first_loader:
+            process_batch(batch)
 
-    first_loader = train_loader_box[0]
-    for batch in first_loader:
-        process_batch(batch)
+        mid_epoch_hook(global_step)
 
-    mid_epoch_hook(global_step)
+        second_loader = train_loader_box[1]
+        if second_loader is None:
+            raise RuntimeError(
+                "mid_epoch_hook must place the second DataLoader in train_loader_box[1]"
+            )
+        for batch in second_loader:
+            process_batch(batch)
 
-    second_loader = train_loader_box[1]
-    if second_loader is None:
-        raise RuntimeError(
-            "mid_epoch_hook must place the second DataLoader in train_loader_box[1]"
-        )
-    for batch in second_loader:
-        process_batch(batch)
+        flush_align_log()
 
-    flush_align_log()
+    if train_diff_parts:
+        train_diff_stats = summarize_margin(np.concatenate(train_diff_parts))
+        log_train_diff_stats(train_diff_stats, log, epoch_1based)
+        if use_mlflow:
+            mlflow.log_metric("train_diff_mean", train_diff_stats["mean"], step=global_step)
+            mlflow.log_metric("train_diff_std", train_diff_stats["std"], step=global_step)
+            mlflow.log_metric(
+                "train_diff_median", train_diff_stats["median"], step=global_step
+            )
+    else:
+        log(f"[epoch {epoch_1based}] train_diff (margin): (no samples)")
+
     return global_step
 
 
@@ -1073,7 +1106,7 @@ def train_dpo(
                 for batch in tqdm(
                     val_loader, desc=f"val DPO [ep {epoch_display}]", leave=False
                 ):
-                    loss, kl_b = hard_dpo_loss(
+                    loss, kl_b, *_ = hard_dpo_loss(
                         batch,
                         tokenizer,
                         policy_model,
@@ -1115,11 +1148,32 @@ def train_dpo(
             log_msg(f"validation pair NLL   : {val_nll:.4f}")
             log_msg(f"validation pair acc   : {100 * val_acc:.2f}%")
 
+            # Always compute full-val DPO margin (diff = Δ_θ − Δ_ref).
+            val_diff_stats = log_val_diff_from_loader(
+                policy_model,
+                ref_model,
+                tokenizer,
+                val_loader,
+                device,
+                log_msg,
+                use_chat_template=use_chat_template,
+            )
+
             if use_mlflow:
                 mlflow.log_metric("val_dpo_loss", val_dpo, step=step_m)
                 mlflow.log_metric("logp_gap_mean", val_kl, step=step_m)
                 mlflow.log_metric("val_pair_nll", val_nll, step=step_m)
                 mlflow.log_metric("val_pair_acc", val_acc, step=step_m)
+                if val_diff_stats:
+                    mlflow.log_metric(
+                        "val_diff_mean", val_diff_stats["mean"], step=step_m
+                    )
+                    mlflow.log_metric(
+                        "val_diff_std", val_diff_stats["std"], step=step_m
+                    )
+                    mlflow.log_metric(
+                        "val_diff_median", val_diff_stats["median"], step=step_m
+                    )
                 try:
                     ef = float(epoch_display)
                 except ValueError:
@@ -1132,9 +1186,7 @@ def train_dpo(
                 and val_distributions_max_batches > 0
                 and len(val_ds) > 0
             ):
-                # Wrapped in try/except: nice-to-have diagnostics
-                # (margin distributions); OOM/NaN here must not kill
-                # the whole epoch — main metrics are already computed above.
+                # Optional subset histograms / npz; full-val mean already logged above.
                 try:
                     dist = compute_val_delta_distributions(
                         policy_model,
@@ -1164,7 +1216,7 @@ def train_dpo(
 
                     log_msg(_val_dist_stats_line("val_delta_theta  ", dt))
                     log_msg(_val_dist_stats_line("val_delta_ref    ", dr))
-                    log_msg(_val_dist_stats_line("val_diff (margin)", margin))
+                    log_msg(_val_dist_stats_line("val_diff (margin, subset)", margin))
 
                     if use_mlflow and margin.size > 0:
                         mlflow.log_metric(
@@ -1172,12 +1224,6 @@ def train_dpo(
                         )
                         mlflow.log_metric(
                             "val_delta_ref_mean", float(np.mean(dr)), step=step_m
-                        )
-                        mlflow.log_metric(
-                            "val_diff_mean", float(np.mean(margin)), step=step_m
-                        )
-                        mlflow.log_metric(
-                            "val_diff_std", float(np.std(margin)), step=step_m
                         )
 
                     npz_path = os.path.join(
@@ -1415,7 +1461,7 @@ def train_dpo(
             init_n = 0
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc="init DPO loss", leave=False):
-                    loss, kl_b = hard_dpo_loss(
+                    loss, kl_b, *_ = hard_dpo_loss(
                         batch,
                         tokenizer,
                         policy_model,
@@ -1452,6 +1498,15 @@ def train_dpo(
             log_msg(f"validation logp_gap_mean : {init_kl:.4f}")
             log_msg(f"validation pair NLL   : {init_nll:.4f}")
             log_msg(f"validation pair acc   : {100 * init_acc:.2f}%")
+            log_val_diff_from_loader(
+                policy_model,
+                ref_model,
+                tokenizer,
+                val_loader,
+                device,
+                log_msg,
+                use_chat_template=use_chat_template,
+            )
             if val_entropy_max_prompts > 0 and len(val_ds) > 0:
                 n_ent = min(int(val_entropy_max_prompts), len(val_ds))
                 log_msg(
