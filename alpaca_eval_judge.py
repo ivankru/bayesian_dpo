@@ -44,10 +44,14 @@ ALPACA_EVAL_V2_REFERENCE_URL = (
 
 JUDGE_MODEL = "Qwen/Qwen2.5-14B-Instruct"
 # Base models for the candidate (evaluate without LoRA or as LoRA base)
-BASE_MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
-BASE_MODEL_7B = "Qwen/Qwen2.5-7B-Instruct"
+try:
+    from utils.config import BASE_MODEL_3B, BASE_MODEL_4B, BASE_MODEL_7B, BASE_MODEL_CHOICES
+except ImportError:
+    BASE_MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
+    BASE_MODEL_4B = "Qwen/Qwen3-4B-Instruct-2507"
+    BASE_MODEL_7B = "Qwen/Qwen2.5-7B-Instruct"
+    BASE_MODEL_CHOICES = {"3b": BASE_MODEL_3B, "4b": BASE_MODEL_4B, "7b": BASE_MODEL_7B}
 BASE_MODEL = BASE_MODEL_3B  # default
-BASE_MODEL_CHOICES = {"3b": BASE_MODEL_3B, "7b": BASE_MODEL_7B}
 
 # Judge prompt template (AlpacaEval-style, ChatML for Qwen)
 JUDGE_SYSTEM = (
@@ -916,7 +920,7 @@ def main():
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="Base model for candidate: 3b (Qwen2.5-3B-Instruct) or 7b (Qwen2.5-7B-Instruct). Default: 3b.",
+        help="Base model for candidate: 3b, 4b (Qwen3-4B), or 7b. Default: 3b.",
     )
     parser.add_argument(
         "--data",
