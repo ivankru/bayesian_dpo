@@ -22,12 +22,13 @@ from config.base_config import (
     VAL_ENTROPY_NUM_SAMPLES,
     VAL_ENTROPY_PROMPT_BATCH_SIZE,
 )
-from utils.config import BASE_MODEL_CHOICES, DPO_STEER_SOFT_DATASET_CHOICES as DATASET_CHOICES
+from utils.config import BASE_MODEL_CHOICES, BASE_MODEL_HELP, DPO_STEER_SOFT_DATASET_CHOICES as DATASET_CHOICES
 from utils.seed import set_seed
 from utils.datasets import (
     build_helpsteer3_soft_datasets,
     build_hh_rlhf_soft_steer_datasets,
     build_openbmb_soft_datasets,
+    build_orca_dpo_soft_steer_datasets,
     build_ultrafeedback_binarized_soft_datasets,
     build_ultrafeedback_score_soft_datasets,
 )
@@ -96,6 +97,7 @@ class SoftDPOConfig:
 
     # --- resume ---
     resume_start_epoch_1based: int = 1
+    save_epoch_checkpoints: bool = True
 
 
 def main(cfg: SoftDPOConfig) -> None:
@@ -104,11 +106,13 @@ def main(cfg: SoftDPOConfig) -> None:
     seed: reproducibility; same default as hard_dpo_steer (42) matches initial val metrics.
     alpha: beta-prior strength for p_bayes; 0.2 is a weak prior (α ≈ 0.2, 2α = 0.4 pseudo-counts).
     use_bayes: if True, loss uses p_bayes; else p (default).
-    base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507.
-    dataset: helpsteer3 | ultrafeedback_binarized (binary p) | ultrafeedback_soft (p from scores) | openbmb | hh_rlhf.
+    base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507;
+        "3.8b" — microsoft/Phi-4-mini-instruct.
+    dataset: helpsteer3 | ultrafeedback_binarized (binary p) | ultrafeedback_soft (p from scores) | openbmb | hh_rlhf | orca_dpo.
     lambda_full_epochs: k (1-based): epochs 1..k labels only; end of epoch k fixes p_pred_teacher; from k+1 λ<1;
         at λ<1, p_pred is always 0.5·teacher + 0.5·σ((beta*diff)/T). 0 — legacy behavior.
     resume_start_epoch_1based: see utils.training.train_dpo (--epochs = full plan, --start-epoch = first epoch this run).
+    save_epoch_checkpoints: if False, do not write epochs/epoch_XXX (only best/ on val NLL).
     """
     if cfg.dataset not in DATASET_CHOICES:
         raise ValueError(
@@ -140,6 +144,9 @@ def main(cfg: SoftDPOConfig) -> None:
     elif cfg.dataset == "hh_rlhf":
         print("Loading PKU processed HH-RLHF (soft train, hard val)...")
         train_soft_ds, val_hard_ds, hard_train_size = build_hh_rlhf_soft_steer_datasets(alpha=cfg.alpha)
+    elif cfg.dataset == "orca_dpo":
+        print("Loading Intel/orca_dpo_pairs (binary train, hard val)...")
+        train_soft_ds, val_hard_ds, hard_train_size = build_orca_dpo_soft_steer_datasets(alpha=cfg.alpha)
     else:  # openbmb
         print("Loading openbmb/UltraFeedback (soft) + val ultrafeedback_binarized...")
         train_soft_ds, val_hard_ds, hard_train_size = build_openbmb_soft_datasets(alpha=cfg.alpha)
@@ -212,6 +219,7 @@ def main(cfg: SoftDPOConfig) -> None:
         val_entropy_forward_chunk_size=cfg.val_entropy_forward_chunk_size,
         resume_start_epoch_1based=cfg.resume_start_epoch_1based,
         resume_checkpoint_dir=cfg.resume_from,
+        save_epoch_checkpoints=cfg.save_epoch_checkpoints,
     )
 
 
@@ -240,7 +248,7 @@ def _parse_cli_to_config() -> SoftDPOConfig:
     parser = argparse.ArgumentParser(
         description=(
             "Soft-DPO (train soft, validation hard): HelpSteer3; UltraFeedback binarized or score-soft; "
-            "openbmb; HH-RLHF (PKU)."
+            "openbmb; HH-RLHF (PKU); Orca DPO pairs."
         )
     )
     parser.add_argument(
@@ -268,7 +276,7 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="Base model: 3b/7b — Qwen2.5-Instruct; 4b — Qwen3-4B-Instruct-2507. Default: 3b.",
+        help=BASE_MODEL_HELP + " Default: 3b.",
     )
     parser.add_argument(
         "--dataset",
@@ -278,7 +286,8 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         choices=list(DATASET_CHOICES),
         help=(
             "Dataset: helpsteer3; ultrafeedback_binarized (hard chosen>rejected, p∈{0,1}); "
-            "ultrafeedback_soft (p=sigmoid(Δscore)); openbmb (soft); hh_rlhf (PKU processed)."
+            "ultrafeedback_soft (p=sigmoid(Δscore)); openbmb (soft); hh_rlhf (PKU processed); "
+            "orca_dpo (Intel/orca_dpo_pairs, binary)."
         ),
     )
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Batch size for train and validation (default: 8).")
@@ -319,6 +328,15 @@ def _parse_cli_to_config() -> SoftDPOConfig:
             "through epoch N if a boundary is found in the log. "
             "With --lambda-full-epochs k and N=k+1, p_pred_teacher is restored from loaded weights "
             "before the epoch loop (as teacher fix at end of epoch k)."
+        ),
+    )
+    parser.add_argument(
+        "--no-epoch-checkpoints",
+        action="store_true",
+        help=(
+            "Do not save epochs/epoch_XXX after each full epoch. "
+            "best/ is still written when val NLL improves. "
+            "Resume from a mid-run epoch then needs best/ or a copied checkpoint."
         ),
     )
     parser.add_argument(
@@ -400,6 +418,7 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         capability_ref_cache_path=args.capability_ref_cache_path,
         val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,
         resume_start_epoch_1based=args.start_epoch,
+        save_epoch_checkpoints=not args.no_epoch_checkpoints,
     )
 
 

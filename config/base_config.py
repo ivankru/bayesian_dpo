@@ -10,7 +10,7 @@ here: token limits, chat template, anchor temperature p_pred, val entropy, and c
 MAX_PROMPT_LEN = 768  # can raise to 1024 if memory allows
 MAX_FULL_LEN = 1536  # prompt+response
 
-# Qwen-Instruct: log p via apply_chat_template (single default for all datasets).
+# Instruct chat template (Qwen / Phi-4-mini / …): log p via apply_chat_template.
 USE_CHAT_TEMPLATE = True
 
 # T>0 for σ((beta*diff)/T) in anchor mode (lambda_full_epochs > 0); see utils.loss.soft_dpo_loss.
@@ -31,7 +31,9 @@ VAL_ENTROPY_MAX_NEW_TOKENS = 128
 
 # Capability retention (eval_datasets): limit=None — no cap on number of examples.
 CAPABILITY_EVAL_LIMIT = None
-CAPABILITY_EVAL_MAX_NEW_TOKENS = 256
+# Was 256; lowered for all models after Phi-4-mini (3.8b) ran out of GPU
+# memory / wall-time on long cap_ret generate (policy hitting the token cap).
+CAPABILITY_EVAL_MAX_NEW_TOKENS = 212
 CAPABILITY_EVAL_BATCH_SIZE = 2
 CAPABILITY_EVAL_MAX_PROMPT_TOKENS = 2048
 

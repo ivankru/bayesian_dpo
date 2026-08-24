@@ -14,11 +14,12 @@ from config.base_config import (
     CAPABILITY_EVAL_MAX_PROMPT_TOKENS,
     USE_CHAT_TEMPLATE,
 )
-from utils.config import BASE_MODEL_CHOICES, DPO_STEER_HARD_DATASET_CHOICES as DATASET_CHOICES
+from utils.config import BASE_MODEL_CHOICES, BASE_MODEL_HELP, DPO_STEER_HARD_DATASET_CHOICES as DATASET_CHOICES
 from utils.seed import set_seed
 from utils.datasets import (
     build_dpo_datasets,
     build_dpo_datasets_hh_rlhf,
+    build_dpo_datasets_orca_dpo,
     build_dpo_datasets_ultrafeedback,
 )
 from utils.models import load_models_and_tokenizer
@@ -52,14 +53,17 @@ def main(
     resume_start_epoch_1based: int = 1,
     grad_clip_norm: float = 0.0,
     optimizer_name: str = "AdamW",
+    save_epoch_checkpoints: bool = True,
 ):
     """
     resume_from: checkpoint path (e.g. "checkpoints/hard_dpo_steer/best").
     If set, policy and tokenizer load from checkpoint and training continues from those weights.
     seed: reproducibility; same seed in hard_dpo_steer and soft_steer matches initial val metrics.
     output_dir: directory for checkpoints and train.log.
-    dataset: "helpsteer3" | "ultrafeedback_binarized" | "hh_rlhf" (PKU processed HH-RLHF).
-    base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507.
+    dataset: "helpsteer3" | "ultrafeedback_binarized" | "hh_rlhf" | "orca_dpo"
+        (Intel/orca_dpo_pairs).
+    base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507;
+        "3.8b" — microsoft/Phi-4-mini-instruct.
     batch_size: batch size for train and validation.
     lambda_min: unused in hard mode (kept for CLI parity with soft_dpo_steer).
     use_chat_template: log p via apply_chat_template (default in config.base_config).
@@ -75,9 +79,14 @@ def main(
     elif dataset == "ultrafeedback_binarized":
         print("Loading UltraFeedback Binarized...")
         train_ds, val_ds = build_dpo_datasets_ultrafeedback()
-    else:
+    elif dataset == "hh_rlhf":
         print("Loading PKU processed HH-RLHF...")
         train_ds, val_ds = build_dpo_datasets_hh_rlhf()
+    elif dataset == "orca_dpo":
+        print("Loading Intel/orca_dpo_pairs...")
+        train_ds, val_ds = build_dpo_datasets_orca_dpo()
+    else:
+        raise ValueError(f"dataset must be one of {DATASET_CHOICES}, got: {dataset!r}")
     model_name = BASE_MODEL_CHOICES[base_model]
     print(f"Model: {model_name}, Dataset: {dataset}, train size: {len(train_ds)}, val size: {len(val_ds)}")
     if resume_from:
@@ -124,6 +133,7 @@ def main(
         resume_checkpoint_dir=resume_from,
         grad_clip_norm=grad_clip_norm,
         optimizer_name=optimizer_name,
+        save_epoch_checkpoints=save_epoch_checkpoints,
     )
 
 
@@ -147,7 +157,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Hard DPO: HelpSteer3, UltraFeedback Binarized, or HH-RLHF (PKU-Alignment/processed-hh-rlhf)."
+        description="Hard DPO: HelpSteer3, UltraFeedback Binarized, HH-RLHF, or Orca DPO pairs."
     )
     parser.add_argument(
         "--resume", "-r",
@@ -163,14 +173,14 @@ if __name__ == "__main__":
         type=str,
         default="helpsteer3",
         choices=list(DATASET_CHOICES),
-        help="Dataset: helpsteer3, ultrafeedback_binarized, or hh_rlhf (PKU-Alignment/processed-hh-rlhf).",
+        help="Dataset: helpsteer3, ultrafeedback_binarized, hh_rlhf, or orca_dpo (Intel/orca_dpo_pairs).",
     )
     parser.add_argument(
         "--base-model",
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="Base model: 3b/7b — Qwen2.5-Instruct; 4b — Qwen3-4B-Instruct-2507. Default: 3b.",
+        help=BASE_MODEL_HELP + " Default: 3b.",
     )
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Batch size for train and validation (default: 8).")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5).")
@@ -204,6 +214,14 @@ if __name__ == "__main__":
             "Epochs in this run: epochs - start + 1. "
             "With --resume and N>1, prior train.log (next to checkpoint) is prepended to train.log in --output-dir "
             "through epoch N if a boundary is found in the log."
+        ),
+    )
+    parser.add_argument(
+        "--no-epoch-checkpoints",
+        action="store_true",
+        help=(
+            "Do not save epochs/epoch_XXX after each full epoch. "
+            "best/ is still written when val NLL improves."
         ),
     )
     parser.add_argument(
@@ -251,4 +269,5 @@ if __name__ == "__main__":
         capability_ref_cache_path=args.capability_ref_cache_path,
         val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,
         resume_start_epoch_1based=args.start_epoch,
+        save_epoch_checkpoints=not args.no_epoch_checkpoints,
     )

@@ -45,12 +45,40 @@ ALPACA_EVAL_V2_REFERENCE_URL = (
 JUDGE_MODEL = "Qwen/Qwen2.5-14B-Instruct"
 # Base models for the candidate (evaluate without LoRA or as LoRA base)
 try:
-    from utils.config import BASE_MODEL_3B, BASE_MODEL_4B, BASE_MODEL_7B, BASE_MODEL_CHOICES
+    from utils.config import (
+        BASE_MODEL_3B,
+        BASE_MODEL_4B,
+        BASE_MODEL_7B,
+        BASE_MODEL_CHOICES,
+        BASE_MODEL_HELP,
+        BASE_MODEL_PHI4MINI,
+        hf_pretrained_kwargs,
+    )
 except ImportError:
     BASE_MODEL_3B = "Qwen/Qwen2.5-3B-Instruct"
     BASE_MODEL_4B = "Qwen/Qwen3-4B-Instruct-2507"
     BASE_MODEL_7B = "Qwen/Qwen2.5-7B-Instruct"
-    BASE_MODEL_CHOICES = {"3b": BASE_MODEL_3B, "4b": BASE_MODEL_4B, "7b": BASE_MODEL_7B}
+    BASE_MODEL_PHI4MINI = "microsoft/Phi-4-mini-instruct"
+    BASE_MODEL_CHOICES = {
+        "3b": BASE_MODEL_3B,
+        "4b": BASE_MODEL_4B,
+        "7b": BASE_MODEL_7B,
+        "3.8b": BASE_MODEL_PHI4MINI,
+        "phi4mini": BASE_MODEL_PHI4MINI,
+    }
+    BASE_MODEL_HELP = (
+        "Base model: 3b/7b — Qwen2.5-Instruct; 4b — Qwen3-4B-Instruct-2507; "
+        "3.8b — microsoft/Phi-4-mini-instruct (~3.8B, MIT)."
+    )
+
+    def hf_pretrained_kwargs(model_id=None):
+        kwargs = {}
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if token:
+            kwargs["token"] = token
+        if model_id == BASE_MODEL_PHI4MINI:
+            kwargs["trust_remote_code"] = False
+        return kwargs
 BASE_MODEL = BASE_MODEL_3B  # default
 
 # Judge prompt template (AlpacaEval-style, ChatML for Qwen)
@@ -245,7 +273,7 @@ def load_candidate_model(
 
     adapter_cfg = ckpt_path / "adapter_config.json"
     if adapter_cfg.is_file():
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        tokenizer = AutoTokenizer.from_pretrained(base_model, **hf_pretrained_kwargs(base_model))
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -253,6 +281,7 @@ def load_candidate_model(
             base_model,
             torch_dtype=dtype,
             device_map=device,
+            **hf_pretrained_kwargs(base_model),
         )
         model = PeftModel.from_pretrained(model, checkpoint_dir)
         model.eval()
@@ -289,7 +318,7 @@ def load_base_model(
     else:
         dtype = torch.float32
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, **hf_pretrained_kwargs(base_model))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -297,6 +326,7 @@ def load_base_model(
         base_model,
         torch_dtype=dtype,
         device_map=device,
+        **hf_pretrained_kwargs(base_model),
     )
     model.eval()
     return tokenizer, model, device
@@ -318,7 +348,7 @@ def load_judge_model(device: Optional[str] = None):
     else:
         dtype = torch.float32
 
-    tokenizer = AutoTokenizer.from_pretrained(JUDGE_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(JUDGE_MODEL, **hf_pretrained_kwargs(JUDGE_MODEL))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -328,6 +358,7 @@ def load_judge_model(device: Optional[str] = None):
         JUDGE_MODEL,
         torch_dtype=dtype,
         device_map=device_map,
+        **hf_pretrained_kwargs(JUDGE_MODEL),
     )
     model.eval()
     return tokenizer, model, device
@@ -920,7 +951,7 @@ def main():
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="Base model for candidate: 3b, 4b (Qwen3-4B), or 7b. Default: 3b.",
+        help=BASE_MODEL_HELP + " Default: 3b.",
     )
     parser.add_argument(
         "--data",

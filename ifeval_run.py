@@ -43,6 +43,7 @@ import torch
 
 from alpaca_eval_judge import (
     BASE_MODEL_CHOICES,
+    BASE_MODEL_HELP,
     generate_responses,
     is_cuda_device,
     load_base_model,
@@ -265,7 +266,7 @@ def main() -> None:
         type=str,
         choices=list(BASE_MODEL_CHOICES.keys()),
         default="3b",
-        help="Base model for candidate: 3b or 7b (Qwen2.5-Instruct).",
+        help=BASE_MODEL_HELP,
     )
     parser.add_argument(
         "--output",

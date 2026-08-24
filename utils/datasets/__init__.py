@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Load and transform datasets for DPO / soft-DPO.
-HelpSteer3, UltraFeedback (binary / score-soft), openbmb/UltraFeedback, PKU-processed HH-RLHF.
+HelpSteer3, UltraFeedback (binary / score-soft), openbmb/UltraFeedback,
+PKU-processed HH-RLHF, Intel Orca DPO pairs.
 """
 from .helpsteer_hard import build_dpo_datasets
 from .helpsteer_soft import build_helpsteer3_soft_datasets
@@ -17,6 +18,7 @@ from .hh_rlf_pku import (
     build_hh_rlhf_soft_steer_datasets,
     extract_pair_hh_soft,
 )
+from .orca_dpo import build_dpo_datasets_orca_dpo, build_orca_dpo_soft_steer_datasets
 from .common import precompute_p_pred_cached, precompute_p_pred_teacher
 
 __all__ = [
@@ -29,6 +31,8 @@ __all__ = [
     "build_hh_rlhf_soft_datasets",
     "build_hh_rlhf_soft_steer_datasets",
     "build_dpo_datasets_hh_rlhf",
+    "build_dpo_datasets_orca_dpo",
+    "build_orca_dpo_soft_steer_datasets",
     "extract_pair_hh_soft",
     "precompute_p_pred_cached",
     "precompute_p_pred_teacher",

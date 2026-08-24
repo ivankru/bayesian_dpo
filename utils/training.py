@@ -72,6 +72,7 @@ OPTIMIZER_CHOICES = ("adamw", "sgd")
 DEFAULT_VAL_KL_MC_MAX_PROMPTS = 256
 
 # Soft/Bayes-ADPO: half-epoch validation and lambda / p_pred_cached update.
+# Large preference sets only (not orca_dpo / helpsteer3).
 ULTRAFB_MID_EPOCH_DATASETS = frozenset(
     {"openbmb", "ultrafeedback_binarized", "ultrafeedback_soft", "hh_rlhf"}
 )
@@ -454,6 +455,15 @@ def _reset_cuda_peak_memory_stats(device: torch.device) -> None:
         pass
 
 
+def _cuda_empty_cache(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _fmt_mem_gb(mem_gb: Optional[float]) -> str:
     if mem_gb is None:
         return "n/a"
@@ -733,6 +743,7 @@ def train_dpo(
     resume_rewarmup_lr_floor: float = 0.0,
     grad_clip_norm: float = 0.0,
     optimizer_name: str = "AdamW",
+    save_epoch_checkpoints: bool = True,
 ):
     """
     Universal DPO loop: hard, soft, or bayes.
@@ -789,6 +800,9 @@ def train_dpo(
     resume_rewarmup_lr_floor: minimum lr fraction at resume (0.0 — ramp from zero over N steps; 0.05 — start at 5%).
     grad_clip_norm: max L2 grad norm. 0 — no clip_grad_norm_ (default).
     optimizer_name: policy optimizer: "AdamW" (default) or "SGD".
+    save_epoch_checkpoints: if True (default), write LoRA weights to epochs/epoch_XXX after
+        each full epoch. If False, only ``best/`` is saved (on val NLL improvement).
+        Resume from a mid-run epoch then requires ``best/`` or an external copy of weights.
     resume_start_epoch_1based: first epoch of this run (1-based, as in logs and epochs/epoch_XXX).
         Require 1 <= resume_start_epoch_1based <= epochs. Checkpoint weights are after epoch N-1
         (e.g. after epoch_003 pass 4).         If N>1, first validation is full val as after epoch (N-1): same header/tags
@@ -914,6 +928,7 @@ def train_dpo(
         "resume_rewarmup_lr_floor": resume_rewarmup_lr_floor,
         "grad_clip_norm": grad_clip_norm,
         "optimizer_name": optimizer_name,
+        "save_epoch_checkpoints": save_epoch_checkpoints,
     }
 
     with _mlflow_training_context(
@@ -1355,6 +1370,9 @@ def train_dpo(
             # Training VRAM peak is logged right after train_one_epoch_dpo (separate line).
             log_msg(f"gpu_mem_peak: validation={_fmt_mem_gb(validation_peak_mem_gb)}")
             log_msg("")
+            # generate() in KL-MC / entropy / cap-retention can leave a large
+            # caching allocator footprint; free it before the next train batch.
+            _cuda_empty_cache(device)
             return val_nll
 
         use_mid_epoch_val = (
@@ -1433,7 +1451,8 @@ def train_dpo(
             f"epochs_this_run={epochs - g0_start}, resume_start_epoch_1based={resume_start_epoch_1based}\n"
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
             f"p_pred_target_temperature={p_pred_target_temperature}, label_noise_prob={_lnp}\n"
-            f"optimizer={optimizer_name}, grad_clip_norm={grad_clip_norm}"
+            f"optimizer={optimizer_name}, grad_clip_norm={grad_clip_norm}, "
+            f"save_epoch_checkpoints={save_epoch_checkpoints}"
         )
         log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
         log_msg(
@@ -1753,6 +1772,7 @@ def train_dpo(
                                 f"({type(e).__name__}: {e}); continuing second half of epoch "
                                 "without mid-epoch metrics."
                             )
+                            _cuda_empty_cache(device)
                         prog_m = _lambda_schedule_progress(
                             g0, epochs, lambda_full_epochs, 0.5
                         )
@@ -1878,15 +1898,21 @@ def train_dpo(
                 policy_model.save_pretrained(ckpt_dir)
                 log_msg(f"New best NLL {val_nll:.4f} -> checkpoint saved: {ckpt_dir}")
 
-            epoch_ckpt_dir = os.path.join(
-                output_dir, "epochs", f"epoch_{g0 + 1:03d}"
-            )
-            os.makedirs(epoch_ckpt_dir, exist_ok=True)
-            tokenizer.save_pretrained(epoch_ckpt_dir)
-            policy_model.save_pretrained(epoch_ckpt_dir)
-            log_msg(
-                f"[epoch {g0 + 1}/{epochs}] checkpoint (full epoch only): {epoch_ckpt_dir}"
-            )
+            if save_epoch_checkpoints:
+                epoch_ckpt_dir = os.path.join(
+                    output_dir, "epochs", f"epoch_{g0 + 1:03d}"
+                )
+                os.makedirs(epoch_ckpt_dir, exist_ok=True)
+                tokenizer.save_pretrained(epoch_ckpt_dir)
+                policy_model.save_pretrained(epoch_ckpt_dir)
+                log_msg(
+                    f"[epoch {g0 + 1}/{epochs}] checkpoint (full epoch only): {epoch_ckpt_dir}"
+                )
+            else:
+                log_msg(
+                    f"[epoch {g0 + 1}/{epochs}] skip epochs/ checkpoint "
+                    "(save_epoch_checkpoints=False)"
+                )
 
         run_finished_at = datetime.now()
         run_duration_sec = perf_counter() - run_started_perf

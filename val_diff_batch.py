@@ -64,6 +64,7 @@ from utils.config import BASE_MODEL_CHOICES, DPO_STEER_SOFT_DATASET_CHOICES
 from utils.datasets import (
     build_dpo_datasets,
     build_dpo_datasets_hh_rlhf,
+    build_dpo_datasets_orca_dpo,
     build_dpo_datasets_ultrafeedback,
     build_openbmb_soft_datasets,
     build_ultrafeedback_score_soft_datasets,
@@ -76,7 +77,10 @@ REPO_ROOT = Path(__file__).resolve().parent
 VAL_DIFF_BEST_LOG = "val_diff_best.log"
 
 ALL_DATASET_CHOICES = tuple(
-    sorted(set(DPO_STEER_SOFT_DATASET_CHOICES) | {"helpsteer3", "ultrafeedback_binarized", "hh_rlhf"})
+    sorted(
+        set(DPO_STEER_SOFT_DATASET_CHOICES)
+        | {"helpsteer3", "ultrafeedback_binarized", "hh_rlhf", "orca_dpo"}
+    )
 )
 
 
@@ -178,6 +182,8 @@ def load_val_dataset(dataset: str, seed: int):
         _, val_ds = build_dpo_datasets_ultrafeedback()
     elif dataset == "hh_rlhf":
         _, val_ds = build_dpo_datasets_hh_rlhf()
+    elif dataset == "orca_dpo":
+        _, val_ds = build_dpo_datasets_orca_dpo()
     elif dataset == "ultrafeedback_soft":
         _, val_ds, _ = build_ultrafeedback_score_soft_datasets(alpha=0.2, seed=seed)
     elif dataset == "openbmb":

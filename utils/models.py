@@ -3,9 +3,10 @@
 Load policy, reference, and tokenizer for DPO (soft/hard).
 
 By default no separate base copy is loaded for ref: ref is the same PeftModel with LoRA
-temporarily disabled (_PeftRefProxy). This saves ~14 GB VRAM on 7B bf16 (≈6 GB on 3B, ≈8 GB on 4B)
-and frees room for a larger batch or disabling gradient checkpointing. For code that needs a real
-standalone PreTrainedModel (e.g. TRL DPOTrainer), pass share_ref_with_policy=False.
+temporarily disabled (_PeftRefProxy). This saves ~14 GB VRAM on 7B bf16 (≈6 GB on 3B, ≈8 GB on 4B;
+Phi-4-mini ~3.8B is similar to 4B) and frees room for a larger batch or disabling gradient
+checkpointing. For code that needs a real standalone PreTrainedModel (e.g. TRL DPOTrainer),
+pass share_ref_with_policy=False.
 """
 import os
 from contextlib import contextmanager
@@ -15,17 +16,12 @@ import torch
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from utils.config import BASE_MODEL_3B
+from utils.config import BASE_MODEL_3B, hf_pretrained_kwargs
 
-# LoRA target_modules presets (Qwen2/Qwen3; any arch with these module names):
-#   "all" — all linear projections (Q/K/V/O + MLP: gate/up/down); default. Standard
-#           choice in modern LoRA/QLoRA recipes (incl. TRL DPO). Yields ~2–3× more
-#           trainable params at the same rank, still < 1% of base; VRAM growth is mostly
-#           AdamW state (2× fp32 per trainable param) — tens of MB vs hundreds of GB activations, negligible.
-#   "attn" — Q/K/V/O only (~1/3 of block params); lowest VRAM per step,
-#           but LoRA touches attention only, not MLP (which holds most model
-#           "knowledge"). Often limits adapter expressiveness for preference alignment
-#           (especially soft/Bayes-DPO). Kept for reproducing older runs.
+# LoRA target_modules presets:
+#   "all" — attention + MLP linears; default. Standard modern LoRA/QLoRA (incl. TRL DPO).
+#   "attn" — attention only; lowest VRAM, weaker for soft/Bayes-DPO. Kept for older runs.
+# Qwen2/Qwen3: q/k/v/o + gate/up/down. Phi-3 / Phi-4-mini: fused qkv_proj + gate_up_proj.
 _LORA_TARGETS_ATTN: List[str] = ["q_proj", "k_proj", "v_proj", "o_proj"]
 _LORA_TARGETS_ALL: List[str] = [
     "q_proj",
@@ -36,21 +32,34 @@ _LORA_TARGETS_ALL: List[str] = [
     "up_proj",
     "down_proj",
 ]
+_LORA_TARGETS_ATTN_PHI: List[str] = ["qkv_proj", "o_proj"]
+_LORA_TARGETS_ALL_PHI: List[str] = [
+    "qkv_proj",
+    "o_proj",
+    "gate_up_proj",
+    "down_proj",
+]
 
 LoraTargetSpec = Union[str, Sequence[str]]
 
 
-def _resolve_lora_target_modules(spec: LoraTargetSpec) -> List[str]:
+def _leaf_module_names(model) -> set:
+    return {n.rsplit(".", 1)[-1] for n, _ in model.named_modules()}
+
+
+def _resolve_lora_target_modules(spec: LoraTargetSpec, model=None) -> List[str]:
     if isinstance(spec, str):
         key = spec.lower()
+        if key not in ("attn", "all"):
+            raise ValueError(
+                f"Unknown lora_target_modules preset={spec!r}; expected 'attn', 'all' "
+                "or a list of module names."
+            )
+        names = _leaf_module_names(model) if model is not None else set()
+        use_phi = "qkv_proj" in names
         if key == "attn":
-            return list(_LORA_TARGETS_ATTN)
-        if key == "all":
-            return list(_LORA_TARGETS_ALL)
-        raise ValueError(
-            f"Unknown lora_target_modules preset={spec!r}; expected 'attn', 'all' "
-            "or a list of module names."
-        )
+            return list(_LORA_TARGETS_ATTN_PHI if use_phi else _LORA_TARGETS_ATTN)
+        return list(_LORA_TARGETS_ALL_PHI if use_phi else _LORA_TARGETS_ALL)
     mods = [str(m).strip() for m in spec if str(m).strip()]
     if not mods:
         raise ValueError("lora_target_modules: empty list")
@@ -207,11 +216,12 @@ def load_models_and_tokenizer(
     dtype_gpu = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     device_gpu = "cuda" if torch.cuda.is_available() else "cpu"
 
+    hub_kw = hf_pretrained_kwargs(model_name)
     if resume_from:
         adapter_dir = resolve_peft_adapter_dir(resume_from)
-        tokenizer = AutoTokenizer.from_pretrained(adapter_dir)
+        tokenizer = AutoTokenizer.from_pretrained(adapter_dir, **hub_kw)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **hub_kw)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -235,6 +245,7 @@ def load_models_and_tokenizer(
             model_name,
             torch_dtype=dtype_gpu,
             device_map=device_gpu,
+            **hub_kw,
         )
         ref_model.eval()
         for p in ref_model.parameters():
@@ -244,6 +255,7 @@ def load_models_and_tokenizer(
         model_name,
         torch_dtype=dtype_gpu,
         device_map=device_gpu,
+        **hub_kw,
     )
     policy_model.config.use_cache = False
 
@@ -255,7 +267,9 @@ def load_models_and_tokenizer(
         )
         policy_model.print_trainable_parameters()
     elif use_lora:
-        resolved_targets = _resolve_lora_target_modules(lora_target_modules)
+        resolved_targets = _resolve_lora_target_modules(
+            lora_target_modules, model=policy_model
+        )
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=lora_r,

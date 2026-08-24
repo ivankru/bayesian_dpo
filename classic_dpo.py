@@ -34,10 +34,11 @@ from config.base_config import (
     VAL_KL_MC_NUM_SAMPLES,
     VAL_KL_MC_PROMPT_BATCH_SIZE,
 )
-from utils.config import BASE_MODEL_CHOICES, MAX_FULL_LEN, MAX_PROMPT_LEN
+from utils.config import BASE_MODEL_CHOICES, BASE_MODEL_HELP, MAX_FULL_LEN, MAX_PROMPT_LEN
 from utils.seed import set_seed
 from utils.datasets import (
     build_dpo_datasets,
+    build_dpo_datasets_orca_dpo,
     build_dpo_datasets_ultrafeedback,
 )
 from utils.loss import hard_dpo_loss
@@ -59,7 +60,7 @@ from utils.val_distributions import log_val_diff_from_loader
 # main
 # ======================
 
-DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized")
+DATASET_CHOICES = ("helpsteer3", "ultrafeedback_binarized", "orca_dpo")
 
 
 def _classic_capability_retention(
@@ -254,7 +255,7 @@ class DPOValidationMetricsCallback(TrainerCallback):
         cap_rows=None,
         cap_ref_holder: Optional[List[Optional[List[str]]]] = None,
         cap_output_dir: Optional[str] = None,
-        cap_max_new_tokens: int = 256,
+        cap_max_new_tokens: int = CAPABILITY_EVAL_MAX_NEW_TOKENS,
         cap_batch_size: int = 2,
         cap_max_prompt_tokens: int = 2048,
         val_kl_mc_max_prompts: int = DEFAULT_VAL_KL_MC_MAX_PROMPTS,
@@ -432,9 +433,14 @@ def main(
     if dataset == "helpsteer3":
         print("Loading HelpSteer3-Preference...")
         train_ds, val_ds = build_dpo_datasets()
-    else:
+    elif dataset == "ultrafeedback_binarized":
         print("Loading UltraFeedback Binarized...")
         train_ds, val_ds = build_dpo_datasets_ultrafeedback()
+    elif dataset == "orca_dpo":
+        print("Loading Intel/orca_dpo_pairs...")
+        train_ds, val_ds = build_dpo_datasets_orca_dpo()
+    else:
+        raise ValueError(f"dataset must be one of {DATASET_CHOICES}, got: {dataset!r}")
     model_name = BASE_MODEL_CHOICES[base_model]
     print(f"Model: {model_name}, Dataset: {dataset}, train size: {len(train_ds)}, val size: {len(val_ds)}")
     if resume_from:
@@ -670,7 +676,7 @@ def main(
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Classic DPO (TRL) on HelpSteer3 / UltraFeedback")
+    parser = argparse.ArgumentParser(description="Classic DPO (TRL) on HelpSteer3 / UltraFeedback / Orca DPO")
     parser.add_argument(
         "--resume", "-r",
         type=str,
@@ -679,8 +685,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility (default: 42)")
     parser.add_argument("--output-dir", "-o", type=str, default="checkpoints/classic_dpo", help="Directory for checkpoints and train.log")
-    parser.add_argument("--dataset", "-d", type=str, default="helpsteer3", choices=list(DATASET_CHOICES), help="Dataset: helpsteer3 or ultrafeedback_binarized")
-    parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help="Base model: 3b or 7b.")
+    parser.add_argument(
+        "--dataset",
+        "-d",
+        type=str,
+        default="helpsteer3",
+        choices=list(DATASET_CHOICES),
+        help="Dataset: helpsteer3, ultrafeedback_binarized, or orca_dpo (Intel/orca_dpo_pairs).",
+    )
+    parser.add_argument("--base-model", type=str, choices=list(BASE_MODEL_CHOICES.keys()), default="3b", help=BASE_MODEL_HELP)
     parser.add_argument("--batch-size", "-b", type=int, default=8, help="Batch size for train and validation (default: 8).")
     parser.add_argument(
         "--grad-accum-steps",

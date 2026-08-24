@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from alpaca_eval_lock import clear_stale_eval_lock, clear_stale_eval_locks_in_tree
+from utils.config import BASE_MODEL_CHOICES, BASE_MODEL_HELP
 
 REPO_ROOT = Path(__file__).resolve().parent
 JUDGE_SCRIPT = REPO_ROOT / "alpaca_eval_judge.py"
@@ -473,9 +474,9 @@ def main() -> None:
     parser.add_argument(
         "--base-model",
         type=str,
-        choices=["3b", "4b", "7b"],
+        choices=list(BASE_MODEL_CHOICES.keys()),
         default="4b",
-        help="Candidate base model key (default: 4b for Qwen3-4B).",
+        help=BASE_MODEL_HELP + " Default: 4b (Qwen3-4B).",
     )
     parser.add_argument(
         "--gpus",
