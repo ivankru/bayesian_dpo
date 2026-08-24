@@ -209,9 +209,6 @@ def run_single_job(
                 str(batch_size),
             ]
         )
-    if skip_existing:
-        cmd.append("--skip-existing")
-    if not judge_only:
         if max_evals is not None:
             cmd.extend(["--max-evals", str(max_evals)])
         if do_sample:
