@@ -563,6 +563,7 @@ def train_one_epoch_dpo(
     align_gap_parts: List[np.ndarray] = []
     align_ts_parts: List[np.ndarray] = []
     train_diff_parts: List[np.ndarray] = []
+    running_diff_parts: List[np.ndarray] = []
 
     def flush_align_log() -> None:
         if not align_ts_parts:
@@ -591,7 +592,9 @@ def train_one_epoch_dpo(
                     align_gap_parts.append(ga)
                 diff_arr = soft_diag.get("diff")
                 if diff_arr is not None and np.asarray(diff_arr).size:
-                    train_diff_parts.append(np.asarray(diff_arr, dtype=np.float64))
+                    arr = np.asarray(diff_arr, dtype=np.float64)
+                    train_diff_parts.append(arr)
+                    running_diff_parts.append(arr)
         else:
             loss, kl_batch = out
         loss.backward()
@@ -630,16 +633,41 @@ def train_one_epoch_dpo(
             flush_align_log()
         if global_step % log_interval == 0:
             n = log_interval
+            if running_diff_parts:
+                window_diff = np.concatenate(running_diff_parts)
+                train_diff_mean = float(np.mean(window_diff))
+                train_diff_std = float(np.std(window_diff))
+                # Per-pair σ(−β Δ_i); mean/std over pairs (not σ of the mean).
+                beta_w = float(loss_kw.get("beta", 0.0))
+                neg_beta_delta = torch.as_tensor(
+                    window_diff, dtype=torch.float32
+                ).mul_(-beta_w)
+                s_i = torch.sigmoid(neg_beta_delta).numpy()
+                sigmoid_mean = float(np.mean(s_i))
+                sigmoid_std = float(np.std(s_i))
+            else:
+                train_diff_mean = float("nan")
+                train_diff_std = float("nan")
+                sigmoid_mean = float("nan")
+                sigmoid_std = float("nan")
             log(
                 f"[epoch {epoch_1based} step {global_step}] "
                 f"loss={running_loss / n:.4f} "
                 f"logp_gap_mean={running_kl / n:.4f} "
+                f"train_diff_mean={train_diff_mean:.4f} "
+                f"train_diff_std={train_diff_std:.4f} "
+                f"sigmoid_mean={sigmoid_mean:.4f} "
+                f"sigmoid_std={sigmoid_std:.4f} "
                 f"grad_abs_mean={running_grad_abs_mean / n:.6e} "
                 f"grad_norm={running_grad_norm / n:.6e}"
             )
             if use_mlflow:
                 mlflow.log_metric("loss", running_loss / n, step=global_step)
                 mlflow.log_metric("logp_gap_mean", running_kl / n, step=global_step)
+                mlflow.log_metric("train_diff_mean", train_diff_mean, step=global_step)
+                mlflow.log_metric("train_diff_std", train_diff_std, step=global_step)
+                mlflow.log_metric("sigmoid_mean", sigmoid_mean, step=global_step)
+                mlflow.log_metric("sigmoid_std", sigmoid_std, step=global_step)
                 mlflow.log_metric(
                     "grad_abs_mean", running_grad_abs_mean / n, step=global_step
                 )
@@ -650,6 +678,7 @@ def train_one_epoch_dpo(
             running_kl = 0.0
             running_grad_abs_mean = 0.0
             running_grad_norm = 0.0
+            running_diff_parts.clear()
 
     split_mid = mid_epoch_hook is not None and len(train_loader_box) == 2
 
