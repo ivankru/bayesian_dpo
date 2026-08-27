@@ -23,7 +23,7 @@ from utils.datasets import (
     build_dpo_datasets_ultrafeedback,
 )
 from utils.models import load_models_and_tokenizer
-from utils.training import DEFAULT_VAL_KL_MC_MAX_PROMPTS, train_dpo
+from utils.training import DEFAULT_VAL_KL_MC_MAX_PROMPTS, ensure_output_dir_lock, train_dpo
 
 
 # ======================
@@ -72,6 +72,12 @@ def main(
     """
     if dataset not in DATASET_CHOICES:
         raise ValueError(f"dataset must be one of {DATASET_CHOICES}, got: {dataset!r}")
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        ensure_output_dir_lock(output_dir)
+    except RuntimeError as e:
+        print(e, file=sys.stderr, flush=True)
+        sys.exit(1)
     set_seed(seed)
     if dataset == "helpsteer3":
         print("Loading HelpSteer3-Preference...")

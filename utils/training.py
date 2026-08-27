@@ -2,6 +2,8 @@
 """
 Shared one-epoch DPO training loop and universal train_dpo (hard / soft / bayes modes).
 """
+import atexit
+import fcntl
 import json
 import math
 import os
@@ -719,6 +721,80 @@ def train_one_epoch_dpo(
     return global_step
 
 
+
+def _read_train_lock_pid(lock_path: str) -> Optional[int]:
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def acquire_output_dir_lock(output_dir: str) -> int:
+    """
+    Exclusive flock on ``{output_dir}/.train.lock``.
+
+    Two jobs with the same RUN_NAME share this directory; without a lock they
+    interleave train.log / best/ and look like a crash. Raises RuntimeError if
+    another process already holds the lock.
+    """
+    lock_path = os.path.join(output_dir, ".train.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        other = _read_train_lock_pid(lock_path)
+        extra = f" pid={other}" if other is not None else ""
+        raise RuntimeError(
+            f"Refusing to start: another training process{extra} already uses "
+            f"{output_dir} (lock {lock_path}). Do not launch two jobs into the "
+            "same RUN_NAME / --output-dir."
+        ) from None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    os.fsync(fd)
+    return fd
+
+
+def release_output_dir_lock(fd: Optional[int], output_dir: str) -> None:
+    if fd is None:
+        return
+    lock_path = os.path.join(output_dir, ".train.lock")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
+
+
+# output_dir -> flock fd; so train_dpo is a no-op if the CLI already locked.
+_held_output_dir_locks: Dict[str, int] = {}
+
+
+def ensure_output_dir_lock(output_dir: str) -> None:
+    """
+    Take ``.train.lock`` once per process, before loading the model.
+
+    If the parent ``universal.sh`` already holds the lock
+    (``SOFT_DPO_TRAIN_LOCK_HELD=1``), do nothing — a second flock on the same
+    file would fail even though this is the same job.
+    """
+    if os.environ.get("SOFT_DPO_TRAIN_LOCK_HELD") == "1":
+        return
+    key = os.path.abspath(output_dir)
+    if key in _held_output_dir_locks:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    fd = acquire_output_dir_lock(output_dir)
+    _held_output_dir_locks[key] = fd
+    atexit.register(release_output_dir_lock, fd, output_dir)
+
+
 def train_dpo(
     train_ds: Dataset,
     val_ds: Dataset,
@@ -866,6 +942,7 @@ def train_dpo(
         device = torch.device(device)
 
     os.makedirs(output_dir, exist_ok=True)
+    ensure_output_dir_lock(output_dir)
     log_path = os.path.join(output_dir, "train.log")
 
     prior_train_log_lines: List[str] = []

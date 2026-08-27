@@ -33,7 +33,7 @@ from utils.datasets import (
     build_ultrafeedback_score_soft_datasets,
 )
 from utils.models import load_models_and_tokenizer
-from utils.training import DEFAULT_VAL_KL_MC_MAX_PROMPTS, train_dpo
+from utils.training import DEFAULT_VAL_KL_MC_MAX_PROMPTS, ensure_output_dir_lock, train_dpo
 
 
 # ======================
@@ -118,6 +118,12 @@ def main(cfg: SoftDPOConfig) -> None:
         raise ValueError(
             f"dataset must be one of {DATASET_CHOICES}, got: {cfg.dataset!r}"
         )
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    try:
+        ensure_output_dir_lock(cfg.output_dir)
+    except RuntimeError as e:
+        print(e, file=sys.stderr, flush=True)
+        sys.exit(1)
     set_seed(cfg.seed)
     model_name = BASE_MODEL_CHOICES[cfg.base_model]
     if cfg.dataset == "helpsteer3":
