@@ -60,6 +60,13 @@ from utils.metrics import (
     run_retention_eval_pair,
     save_ref_texts_cache,
 )
+from utils.probe_margins import (
+    StepTracker,
+    build_probe_loader,
+    cache_ref_logps,
+    load_or_create_probe_indices,
+    snapshot_probe,
+)
 from utils.val_distributions import (
     compute_val_delta_distributions,
     log_train_diff_stats,
@@ -540,6 +547,8 @@ def train_one_epoch_dpo(
     log=print,
     use_mlflow: bool = False,
     mid_epoch_hook: Optional[Callable[[int], None]] = None,
+    step_tracker: Optional[StepTracker] = None,
+    after_step_hook: Optional[Callable[[int, int], None]] = None,
 ) -> int:
     """
     One DPO epoch. loss_fn(..., **loss_kw) returns (loss, kl_approx).
@@ -618,8 +627,15 @@ def train_one_epoch_dpo(
             torch.nn.utils.clip_grad_norm_(
                 policy_model.parameters(), grad_clip_norm
             )
+        # η used by this update is the current group lr; scheduler.step() after
+        # optimizer.step() advances lr for the *next* batch.
+        lr_used = float(optimizer.param_groups[0]["lr"])
         optimizer.step()
         scheduler.step()
+        if step_tracker is not None:
+            step_tracker.H_cum += lr_used
+            step_tracker.last_lr = lr_used
+            step_tracker.last_grad_norm = float(grad_norm)
 
         running_loss += loss.item()
         running_kl += kl_batch
@@ -682,6 +698,9 @@ def train_one_epoch_dpo(
             running_grad_norm = 0.0
             running_diff_parts.clear()
 
+        if after_step_hook is not None:
+            after_step_hook(global_step, epoch_1based)
+
     split_mid = mid_epoch_hook is not None and len(train_loader_box) == 2
 
     if not split_mid:
@@ -719,7 +738,6 @@ def train_one_epoch_dpo(
         log(f"[epoch {epoch_1based}] train_diff (margin): (no samples)")
 
     return global_step
-
 
 
 def _read_train_lock_pid(lock_path: str) -> Optional[int]:
@@ -849,6 +867,10 @@ def train_dpo(
     grad_clip_norm: float = 0.0,
     optimizer_name: str = "AdamW",
     save_epoch_checkpoints: bool = True,
+    probe_margins: bool = False,
+    probe_size: int = 256,
+    probe_every: int = 100,
+    probe_seed: int = 0,
 ):
     """
     Universal DPO loop: hard, soft, or bayes.
@@ -907,7 +929,22 @@ def train_dpo(
     optimizer_name: policy optimizer: "AdamW" (default) or "SGD".
     save_epoch_checkpoints: if True (default), write LoRA weights to epochs/epoch_XXX after
         each full epoch. If False, only ``best/`` is saved (on val NLL improvement).
-        Resume from a mid-run epoch then requires ``best/`` or an external copy of weights.
+        ``best/`` is written as soon as pairwise val NLL is known, before KL-MC /
+        response entropy / capability-retention generate (those can take ~1h and
+        are the usual kill point on the last epoch). Resume from a mid-run epoch
+        then requires ``best/`` or an external copy of weights.
+    probe_margins: if True, every ``probe_every`` steps evaluate Δ on a fixed val
+        subset. Orca uses committed ``utils/probe_indices_orca_dpo.py``
+        (256 pairs; not resampled from ``probe_seed``). Other datasets sample
+        once with ``probe_size`` / ``probe_seed`` (not the training seed) and
+        lock the result in the run dir. Ref logps are cached once. Writes
+        ``probe_indices.json``, ``probe_ref_logps.npz``, ``probe_margins.jsonl``,
+        and full-val Δ ``val_deltas/epoch_*.npz`` at each validation (same
+        forward as val_diff). jsonl also stores this-step lr, H_cum=Ση, and
+        endpoint grad_norm.
+    probe_size / probe_every / probe_seed: cadence plus subset size/RNG when
+        there is no canonical file (default 256 / 100 / 0). Orca ignores
+        ``probe_size`` / ``probe_seed`` in favor of the frozen index list.
     resume_start_epoch_1based: first epoch of this run (1-based, as in logs and epochs/epoch_XXX).
         Require 1 <= resume_start_epoch_1based <= epochs. Checkpoint weights are after epoch N-1
         (e.g. after epoch_003 pass 4).         If N>1, first validation is full val as after epoch (N-1): same header/tags
@@ -1035,6 +1072,10 @@ def train_dpo(
         "grad_clip_norm": grad_clip_norm,
         "optimizer_name": optimizer_name,
         "save_epoch_checkpoints": save_epoch_checkpoints,
+        "probe_margins": probe_margins,
+        "probe_size": probe_size,
+        "probe_every": probe_every,
+        "probe_seed": probe_seed,
     }
 
     with _mlflow_training_context(
@@ -1063,6 +1104,33 @@ def train_dpo(
             train_ds, train_collate, batch_size, g
         )
         val_loader = _make_ordered_loader(val_ds, collate_fn_hard, batch_size)
+
+        if probe_margins:
+            if int(probe_size) < 1:
+                raise ValueError(f"probe_size must be >= 1, got {probe_size!r}")
+            if int(probe_every) < 1:
+                raise ValueError(f"probe_every must be >= 1, got {probe_every!r}")
+
+        probe_indices: List[int] = []
+        probe_loader = None
+        probe_logp_c_ref: Optional[np.ndarray] = None
+        probe_logp_r_ref: Optional[np.ndarray] = None
+        probe_jsonl_path = os.path.join(output_dir, "probe_margins.jsonl")
+        step_tracker = StepTracker()
+
+        if probe_margins and len(val_ds) > 0:
+            probe_indices = load_or_create_probe_indices(
+                os.path.join(output_dir, "probe_indices.json"),
+                n_val=len(val_ds),
+                size=int(probe_size),
+                probe_seed=int(probe_seed),
+                log=log_msg,
+                dataset_name=dataset_name,
+                val_ds=val_ds,
+            )
+            probe_loader = build_probe_loader(
+                val_ds, probe_indices, batch_size, collate_fn_hard
+            )
 
         cap_rows: Optional[List[EvalRow]] = None
         cap_ref_cache: List[Optional[List[str]]] = [None]
@@ -1141,6 +1209,73 @@ def train_dpo(
         def _epoch_tag_for_files(epoch_display: str) -> str:
             return epoch_display.replace(".", "_")
 
+        def _val_diff_dump_kwargs(epoch_display: str, step: int) -> Dict[str, Any]:
+            if not probe_margins:
+                return {}
+            tag = _epoch_tag_for_files(str(epoch_display))
+            return {
+                "save_npz_path": os.path.join(
+                    output_dir, "val_deltas", f"epoch_{tag}.npz"
+                ),
+                "extra_npz": {
+                    "step": np.int64(step),
+                    "lr": np.float64(step_tracker.last_lr),
+                    "H_cum": np.float64(step_tracker.H_cum),
+                    "grad_norm": np.float64(step_tracker.last_grad_norm),
+                },
+            }
+
+        def _run_probe_snapshot(step: int, epoch_1based: int) -> None:
+            if probe_loader is None or probe_logp_c_ref is None or probe_logp_r_ref is None:
+                return
+            stats = snapshot_probe(
+                policy_model,
+                tokenizer,
+                probe_loader,
+                probe_logp_c_ref,
+                probe_logp_r_ref,
+                device,
+                use_chat_template,
+                jsonl_path=probe_jsonl_path,
+                step=int(step),
+                epoch_1based=int(epoch_1based),
+                beta=float(beta),
+                lr=float(step_tracker.last_lr),
+                H_cum=float(step_tracker.H_cum),
+                grad_norm=float(step_tracker.last_grad_norm),
+                log=log_msg,
+            )
+            if use_mlflow and stats:
+                if stats.get("mean") == stats.get("mean"):
+                    mlflow.log_metric("probe_delta_mean", stats["mean"], step=step)
+                if step_tracker.last_lr == step_tracker.last_lr:
+                    mlflow.log_metric("probe_lr", step_tracker.last_lr, step=step)
+                mlflow.log_metric("probe_H_cum", step_tracker.H_cum, step=step)
+                if step_tracker.last_grad_norm == step_tracker.last_grad_norm:
+                    mlflow.log_metric(
+                        "probe_grad_norm", step_tracker.last_grad_norm, step=step
+                    )
+
+        def _maybe_probe_after_step(step: int, epoch_1based: int) -> None:
+            if probe_loader is None:
+                return
+            if int(step) % int(probe_every) != 0:
+                return
+            _run_probe_snapshot(step, epoch_1based)
+
+        # Mutated as soon as pairwise NLL is known (before generate metrics).
+        best_val_nll_box = [float("inf")]
+
+        def _save_best_checkpoint(val_nll: float) -> None:
+            if val_nll >= best_val_nll_box[0]:
+                return
+            best_val_nll_box[0] = val_nll
+            ckpt_dir = os.path.join(output_dir, "best")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            tokenizer.save_pretrained(ckpt_dir)
+            policy_model.save_pretrained(ckpt_dir)
+            log_msg(f"New best NLL {val_nll:.4f} -> checkpoint saved: {ckpt_dir}")
+
         def _run_capability_retention(epoch_display: str, step_m: int) -> None:
             if cap_rows is None:
                 return
@@ -1207,6 +1342,7 @@ def train_dpo(
             epoch_display: str,
             mlflow_step: Optional[int] = None,
             training_seconds: Optional[float] = None,
+            save_best: bool = False,
         ) -> float:
             """epoch_display: '1', '0.5', '1.5', ... for logs and artifact names. Returns val NLL."""
             tag = _epoch_tag_for_files(epoch_display)
@@ -1278,6 +1414,7 @@ def train_dpo(
                 device,
                 log_msg,
                 use_chat_template=use_chat_template,
+                **_val_diff_dump_kwargs(epoch_display, step_m),
             )
 
             if use_mlflow:
@@ -1361,6 +1498,11 @@ def train_dpo(
                         "validation delta distributions: FAILED "
                         f"({type(e).__name__}: {e}); continuing without margin-distribution metrics"
                     )
+
+            # Save best before generate (KL-MC / entropy / cap_ret). Those can
+            # run for ~1h; a kill there must not drop an already-known better NLL.
+            if save_best:
+                _save_best_checkpoint(val_nll)
 
             if val_kl_mc_max_prompts > 0 and len(val_ds) > 0:
                 n_mc = min(int(val_kl_mc_max_prompts), len(val_ds))
@@ -1558,7 +1700,9 @@ def train_dpo(
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
             f"p_pred_target_temperature={p_pred_target_temperature}, label_noise_prob={_lnp}\n"
             f"optimizer={optimizer_name}, grad_clip_norm={grad_clip_norm}, "
-            f"save_epoch_checkpoints={save_epoch_checkpoints}"
+            f"save_epoch_checkpoints={save_epoch_checkpoints}\n"
+            f"probe_margins={probe_margins}, probe_size={probe_size}, "
+            f"probe_every={probe_every}, probe_seed={probe_seed}"
         )
         log_msg(f"MAX_PROMPT_LEN={MAX_PROMPT_LEN}, MAX_FULL_LEN={MAX_FULL_LEN}, use_chat_template={use_chat_template}")
         log_msg(
@@ -1631,6 +1775,7 @@ def train_dpo(
                 device,
                 log_msg,
                 use_chat_template=use_chat_template,
+                **_val_diff_dump_kwargs("0", 0),
             )
             if val_entropy_max_prompts > 0 and len(val_ds) > 0:
                 n_ent = min(int(val_entropy_max_prompts), len(val_ds))
@@ -1737,6 +1882,11 @@ def train_dpo(
         scheduler = LambdaLR(optimizer, lr_lambda=_lr_lambda)
         for _ in range(start_global_step):
             scheduler.step()
+        # Completed steps 0..N-1 used lr_lambda(k)*lr (rewarmup ramp is 1 for k < start).
+        step_tracker.H_cum = float(lr) * sum(
+            float(_lr_lambda(k)) for k in range(int(start_global_step))
+        )
+        step_tracker.last_lr = float(optimizer.param_groups[0]["lr"])
 
         if do_resume_rewarmup:
             log_msg(
@@ -1783,10 +1933,25 @@ def train_dpo(
                 f"p_pred = 0.5·p_teacher + 0.5·σ((β·diff)/T)."
             )
 
-        best_val_nll = (
+        best_val_nll_box[0] = (
             float("inf") if checkpoint_val_nll is None else float(checkpoint_val_nll)
         )
         global_step = start_global_step
+        if probe_loader is not None:
+            probe_logp_c_ref, probe_logp_r_ref = cache_ref_logps(
+                ref_model,
+                tokenizer,
+                probe_loader,
+                device,
+                use_chat_template,
+                cache_path=os.path.join(output_dir, "probe_ref_logps.npz"),
+                indices=probe_indices,
+            )
+            log_msg(
+                f"probe: cached ref logps n={int(probe_logp_c_ref.shape[0])} "
+                f"(two policy forwards per snapshot, every {probe_every} steps)"
+            )
+            _run_probe_snapshot(global_step, max(1, g0_start))
         for g0 in range(g0_start, epochs):
             log_msg("")
             log_msg(f"=== Epoch {g0 + 1}/{epochs} ===")
@@ -1948,6 +2113,8 @@ def train_dpo(
                 log=log_msg,
                 use_mlflow=use_mlflow,
                 mid_epoch_hook=mid_hook if mode != "hard" else None,
+                step_tracker=step_tracker if probe_margins else None,
+                after_step_hook=_maybe_probe_after_step if probe_margins else None,
             )
             training_seconds = perf_counter() - t_training_start
             training_peak_mem_gb = _gpu_peak_memory_gb(device)
@@ -1991,18 +2158,11 @@ def train_dpo(
                 )
 
             policy_model.eval()
-            val_nll = _run_validation(
+            _run_validation(
                 str(g0 + 1),
                 training_seconds=training_seconds,
+                save_best=True,
             )
-
-            if val_nll < best_val_nll:
-                best_val_nll = val_nll
-                ckpt_dir = os.path.join(output_dir, "best")
-                os.makedirs(ckpt_dir, exist_ok=True)
-                tokenizer.save_pretrained(ckpt_dir)
-                policy_model.save_pretrained(ckpt_dir)
-                log_msg(f"New best NLL {val_nll:.4f} -> checkpoint saved: {ckpt_dir}")
 
             if save_epoch_checkpoints:
                 epoch_ckpt_dir = os.path.join(

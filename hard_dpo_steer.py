@@ -54,6 +54,10 @@ def main(
     grad_clip_norm: float = 0.0,
     optimizer_name: str = "AdamW",
     save_epoch_checkpoints: bool = True,
+    probe_margins: bool = False,
+    probe_size: int = 256,
+    probe_every: int = 100,
+    probe_seed: int = 0,
 ):
     """
     resume_from: checkpoint path (e.g. "checkpoints/hard_dpo_steer/best").
@@ -140,6 +144,10 @@ def main(
         grad_clip_norm=grad_clip_norm,
         optimizer_name=optimizer_name,
         save_epoch_checkpoints=save_epoch_checkpoints,
+        probe_margins=probe_margins,
+        probe_size=probe_size,
+        probe_every=probe_every,
+        probe_seed=probe_seed,
     )
 
 
@@ -257,6 +265,35 @@ if __name__ == "__main__":
             f"(default {DEFAULT_VAL_KL_MC_MAX_PROMPTS})."
         ),
     )
+    parser.add_argument(
+        "--probe-margins",
+        action="store_true",
+        help=(
+            "Every --probe-every steps, log Δ on a fixed val subset "
+            "(--probe-size pairs, --probe-seed; not the training seed). "
+            "Caches frozen ref logps (2 policy forwards/snapshot). Writes "
+            "probe_margins.jsonl plus full-val Δ at each epoch val. "
+            "No extra 100-pair set."
+        ),
+    )
+    parser.add_argument(
+        "--probe-size",
+        type=int,
+        default=256,
+        help="Fixed val probe size when --probe-margins is set (default: 256).",
+    )
+    parser.add_argument(
+        "--probe-every",
+        type=int,
+        default=100,
+        help="Probe cadence in optimizer steps when --probe-margins is set (default: 100).",
+    )
+    parser.add_argument(
+        "--probe-seed",
+        type=int,
+        default=0,
+        help="RNG seed for the probe subset; independent of --seed (default: 0).",
+    )
     args = parser.parse_args()
     main(
         resume_from=args.resume,
@@ -276,4 +313,8 @@ if __name__ == "__main__":
         val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,
         resume_start_epoch_1based=args.start_epoch,
         save_epoch_checkpoints=not args.no_epoch_checkpoints,
+        probe_margins=args.probe_margins,
+        probe_size=args.probe_size,
+        probe_every=args.probe_every,
+        probe_seed=args.probe_seed,
     )

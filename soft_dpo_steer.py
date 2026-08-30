@@ -99,6 +99,12 @@ class SoftDPOConfig:
     resume_start_epoch_1based: int = 1
     save_epoch_checkpoints: bool = True
 
+    # --- fixed-probe Δ (off by default) ---
+    probe_margins: bool = False
+    probe_size: int = 256
+    probe_every: int = 100
+    probe_seed: int = 0
+
 
 def main(cfg: SoftDPOConfig) -> None:
     """Soft train + hard validation. All hyperparameters live in SoftDPOConfig.
@@ -226,6 +232,10 @@ def main(cfg: SoftDPOConfig) -> None:
         resume_start_epoch_1based=cfg.resume_start_epoch_1based,
         resume_checkpoint_dir=cfg.resume_from,
         save_epoch_checkpoints=cfg.save_epoch_checkpoints,
+        probe_margins=cfg.probe_margins,
+        probe_size=cfg.probe_size,
+        probe_every=cfg.probe_every,
+        probe_seed=cfg.probe_seed,
     )
 
 
@@ -400,6 +410,35 @@ def _parse_cli_to_config() -> SoftDPOConfig:
             f"(default {DEFAULT_VAL_KL_MC_MAX_PROMPTS})."
         ),
     )
+    parser.add_argument(
+        "--probe-margins",
+        action="store_true",
+        help=(
+            "Every --probe-every steps, log Δ on a fixed val subset "
+            "(--probe-size pairs, --probe-seed; not the training seed). "
+            "Caches frozen ref logps (2 policy forwards/snapshot). Writes "
+            "probe_margins.jsonl plus full-val Δ at each epoch val. "
+            "No extra 100-pair set."
+        ),
+    )
+    parser.add_argument(
+        "--probe-size",
+        type=int,
+        default=256,
+        help="Fixed val probe size when --probe-margins is set (default: 256).",
+    )
+    parser.add_argument(
+        "--probe-every",
+        type=int,
+        default=100,
+        help="Probe cadence in optimizer steps when --probe-margins is set (default: 100).",
+    )
+    parser.add_argument(
+        "--probe-seed",
+        type=int,
+        default=0,
+        help="RNG seed for the probe subset; independent of --seed (default: 0).",
+    )
     args = parser.parse_args()
     return SoftDPOConfig(
         resume_from=args.resume,
@@ -425,6 +464,10 @@ def _parse_cli_to_config() -> SoftDPOConfig:
         val_kl_mc_max_prompts=args.val_kl_mc_max_prompts,
         resume_start_epoch_1based=args.start_epoch,
         save_epoch_checkpoints=not args.no_epoch_checkpoints,
+        probe_margins=args.probe_margins,
+        probe_size=args.probe_size,
+        probe_every=args.probe_every,
+        probe_seed=args.probe_seed,
     )
 
 

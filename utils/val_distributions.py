@@ -4,7 +4,8 @@ Validation distributions of DPO logits: delta_theta, delta_ref, diff (margin).
 """
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+import os
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -92,10 +93,16 @@ def log_val_diff_from_loader(
     log_fn: Callable[[str], None],
     use_chat_template: bool = False,
     max_batches: Optional[int] = None,
+    save_npz_path: Optional[str] = None,
+    extra_npz: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
-    """Compute and log validation DPO margin; failures are logged, not raised."""
+    """Compute and log validation DPO margin; failures are logged, not raised.
+
+    If ``save_npz_path`` is set, write the full Δ vectors from this same forward
+    (no extra eval). ``extra_npz`` is merged into the archive (scalars ok).
+    """
     try:
-        stats = compute_val_margin_stats(
+        dist = compute_val_delta_distributions(
             policy_model,
             ref_model,
             tokenizer,
@@ -104,7 +111,18 @@ def log_val_diff_from_loader(
             use_chat_template=use_chat_template,
             max_batches=max_batches,
         )
+        stats = summarize_margin(dist["diff"])
         log_val_diff_stats(stats, log_fn)
+        if save_npz_path:
+            payload: Dict[str, Any] = dict(dist)
+            if extra_npz:
+                payload.update(extra_npz)
+            parent = os.path.dirname(save_npz_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            np.savez_compressed(save_npz_path, **payload)
+            n = int(dist["diff"].size)
+            log_fn(f"validation val_diff arrays : n={n} -> {save_npz_path}")
         return stats
     except Exception as exc:
         log_fn(
