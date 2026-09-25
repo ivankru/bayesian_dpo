@@ -49,6 +49,7 @@ def _logps(
     responses,
     device,
     use_chat_template: bool = USE_CHAT_TEMPLATE,
+    return_lengths: bool = False,
 ):
     return get_logps(
         model,
@@ -59,4 +60,5 @@ def _logps(
         MAX_PROMPT_LEN,
         MAX_FULL_LEN,
         use_chat_template=use_chat_template,
+        return_lengths=return_lengths,
     )

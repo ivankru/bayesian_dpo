@@ -30,9 +30,13 @@ def get_logps(
     max_prompt_len: int = 768,
     max_full_len: int = 1024,
     use_chat_template: bool = False,
-) -> torch.Tensor:
+    return_lengths: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     log p(response | prompt) = sum of token log-probs on the response.
+
+    If return_lengths=True, also return the number of response tokens over
+    exactly the same suffix used in the log-probability sum.
 
     use_chat_template=False: legacy plain ``prompt + "\\n" + response`` and prefix length
     from a separate prompt tokenization (no chat template).
@@ -68,23 +72,31 @@ def get_logps(
         logprobs = F.log_softmax(logits, dim=-1)
 
         input_ids = full_batch["input_ids"]
+        attention_mask = full_batch["attention_mask"]
         B, T = input_ids.shape
 
         logp_list = []
+        length_list = []
         for i in range(B):
             pl = prompt_lengths[i].item()
             start = pl
+            eff = int(attention_mask[i].sum().item())
 
-            if start >= T:
+            if start < 1 or start >= eff:
                 logp_list.append(logprobs[i, 0, 0] * 0)
+                length_list.append(0)
                 continue
 
-            lp = logprobs[i, start - 1 : T - 1, :]
-            ids = input_ids[i, start:T]
+            lp = logprobs[i, start - 1 : eff - 1, :]
+            ids = input_ids[i, start:eff]
             lp_tokens = lp.gather(-1, ids.unsqueeze(-1)).squeeze(-1)
             logp_list.append(lp_tokens.sum())
+            length_list.append(int(ids.numel()))
 
-        return torch.stack(logp_list, dim=0)
+        logps = torch.stack(logp_list, dim=0)
+        if return_lengths:
+            return logps, torch.as_tensor(length_list, dtype=torch.long, device=device)
+        return logps
 
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
@@ -134,19 +146,25 @@ def get_logps(
     logprobs = F.log_softmax(logits, dim=-1)
 
     logp_list = []
+    length_list = []
     for i in range(B):
         eff = int(attention_mask[i].sum().item())
         start = batch_prefix_lens[i]
         start = min(start, eff)
         if start < 1 or start >= eff:
             logp_list.append(logprobs[i, 0, 0] * 0)
+            length_list.append(0)
             continue
         lp = logprobs[i, start - 1 : eff - 1, :]
         ids = input_ids[i, start:eff]
         lp_tokens = lp.gather(-1, ids.unsqueeze(-1)).squeeze(-1)
         logp_list.append(lp_tokens.sum())
+        length_list.append(int(ids.numel()))
 
-    return torch.stack(logp_list, dim=0)
+    logps = torch.stack(logp_list, dim=0)
+    if return_lengths:
+        return logps, torch.as_tensor(length_list, dtype=torch.long, device=device)
+    return logps
 
 
 def eval_pairwise_accuracy(

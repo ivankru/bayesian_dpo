@@ -1,5 +1,6 @@
 from .base import DpoLossFn
 from .hard import hard_dpo_loss
+from .simpo import simpo_loss
 from .classic import soft_dpo_classic_loss
 from .approximation import (
     soft_dpo_approximation_loss,
@@ -9,6 +10,7 @@ from .approximation import (
 
 LOSS_REGISTRY: dict[str, DpoLossFn] = {
     "hard_dpo_loss": hard_dpo_loss,
+    "simpo_loss": simpo_loss,
     "soft_dpo_classic_loss": soft_dpo_classic_loss,
     "soft_dpo_approximation_loss": soft_dpo_approximation_loss,
     "soft_dpo_centered_softplus_loss": soft_dpo_centered_softplus_loss,

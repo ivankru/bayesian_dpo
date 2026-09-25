@@ -40,6 +40,8 @@ def main(
     batch_size: int = 8,
     lr: float = 2e-5,
     beta: float = 0.2,
+    hard_loss_type: str = "dpo",
+    simpo_gamma: float = 1.0,
     epochs: int = 8,
     lambda_min: float = 1.0,
     use_chat_template: bool = USE_CHAT_TEMPLATE,
@@ -69,6 +71,8 @@ def main(
     base_model: "3b" | "7b" — Qwen2.5-*B-Instruct; "4b" — Qwen3-4B-Instruct-2507;
         "3.8b" — microsoft/Phi-4-mini-instruct.
     batch_size: batch size for train and validation.
+    hard_loss_type: "dpo" for standard hard DPO, "simpo" for reference-free SimPO.
+    simpo_gamma: target margin γ for SimPO; ignored by hard DPO.
     lambda_min: unused in hard mode (kept for CLI parity with soft_dpo_steer).
     use_chat_template: log p via apply_chat_template (default in config.base_config).
     capability_eval_dir: if set, eval_datasets (gold) on each validation; see train_dpo.
@@ -112,7 +116,8 @@ def main(
         # Keeps a clean `>run.log` with meaningful lines only.
         print(msg, flush=True, file=sys.stdout)
 
-    print("Starting DPO (hard) training...")
+    mode = "simpo" if hard_loss_type == "simpo" else "hard"
+    print(f"Starting {mode.upper()} training on hard pairs...")
     train_dpo(
         train_ds,
         val_ds,
@@ -120,11 +125,12 @@ def main(
         policy_model,
         ref_model,
         device,
-        mode="hard",
+        mode=mode,
         epochs=epochs,
         batch_size=batch_size,
         lr=lr,
         beta=beta,
+        simpo_gamma=simpo_gamma,
         output_dir=output_dir,
         dataset_name=dataset,
         model_name=model_name,
@@ -204,7 +210,20 @@ if __name__ == "__main__":
         default="AdamW",
         help="Policy optimizer (case-insensitive): AdamW (default) or SGD.",
     )
-    parser.add_argument("--beta", type=float, default=0.2, help="DPO beta parameter (default: 0.2).")
+    parser.add_argument("--beta", type=float, default=0.2, help="DPO/SimPO beta parameter (default: 0.2).")
+    parser.add_argument(
+        "--hard-loss-type",
+        type=str,
+        choices=["dpo", "simpo"],
+        default="dpo",
+        help="Hard-pair train loss: dpo (default) or simpo.",
+    )
+    parser.add_argument(
+        "--simpo-gamma",
+        type=float,
+        default=1.0,
+        help="SimPO target margin gamma for --hard-loss-type simpo (default: 1.0).",
+    )
     parser.add_argument(
         "--grad-clip-norm",
         type=float,
@@ -304,6 +323,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         beta=args.beta,
+        hard_loss_type=args.hard_loss_type,
+        simpo_gamma=args.simpo_gamma,
         optimizer_name=args.optimizer,
         grad_clip_norm=args.grad_clip_norm,
         epochs=args.epochs,

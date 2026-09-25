@@ -74,7 +74,7 @@ from utils.val_distributions import (
     summarize_margin,
 )
 
-DPO_MODE_CHOICES = ("hard", "soft", "bayes")
+DPO_MODE_CHOICES = ("hard", "simpo", "soft", "bayes")
 OPTIMIZER_CHOICES = ("adamw", "sgd")
 
 # MC forward KL(π‖ref) from π_θ samples; min(N, len(val)) prompts. 0 in val_kl_mc_max_prompts disables.
@@ -129,7 +129,7 @@ def slice_train_log_lines_before_resume_start_epoch(
             if boundary.match(line):
                 return lines[:i]
         return []
-    if mode == "hard":
+    if mode in ("hard", "simpo"):
         boundary = re.compile(rf"^\[epoch {int(s)}\]")
         for i, line in enumerate(lines):
             if boundary.match(line):
@@ -319,6 +319,7 @@ def _build_loss_spec(
     use_chat_template: bool,
     p_pred_target_temperature: float,
     soft_loss_type: str,
+    simpo_gamma: float,
 ) -> Tuple[Callable, Callable, Dict[str, Any], str]:
     """Return (train_collate, train_loss_fn, loss_kwargs, mode_label) for the mode.
 
@@ -330,6 +331,13 @@ def _build_loss_spec(
             hard_dpo_loss,
             {"beta": beta, "use_chat_template": use_chat_template},
             "Hard DPO",
+        )
+    if mode == "simpo":
+        return (
+            collate_fn_hard,
+            get_loss("simpo_loss"),
+            {"beta": beta, "gamma": simpo_gamma, "use_chat_template": use_chat_template},
+            "SimPO",
         )
     use_bayes = mode == "bayes"
     soft_loss_by_type = {
@@ -657,10 +665,13 @@ def train_one_epoch_dpo(
                 train_diff_std = float(np.std(window_diff))
                 # Per-pair σ(−β Δ_i); mean/std over pairs (not σ of the mean).
                 beta_w = float(loss_kw.get("beta", 0.0))
-                neg_beta_delta = torch.as_tensor(
-                    window_diff, dtype=torch.float32
-                ).mul_(-beta_w)
-                s_i = torch.sigmoid(neg_beta_delta).numpy()
+                # For SimPO, diff is the length-normalized margin m and the
+                # gradient weight is sigma(gamma - beta * m). Other losses keep
+                # the existing DPO diagnostic sigma(-beta * diff).
+                logit_neg = torch.as_tensor(window_diff, dtype=torch.float32).mul_(-beta_w)
+                if "gamma" in loss_kw:
+                    logit_neg = logit_neg.add(float(loss_kw["gamma"]))
+                s_i = torch.sigmoid(logit_neg).numpy()
                 sigmoid_mean = float(np.mean(s_i))
                 sigmoid_std = float(np.std(s_i))
             else:
@@ -825,6 +836,7 @@ def train_dpo(
     batch_size: int = 8,
     lr: float = 5e-6,
     beta: float = 0.2,
+    simpo_gamma: float = 1.0,
     alpha: float = 1.0,
     output_dir: str = "checkpoints/dpo",
     num_training_steps_override: Optional[int] = None,
@@ -876,9 +888,11 @@ def train_dpo(
     Universal DPO loop: hard, soft, or bayes.
 
     mode: "hard" — train/val chosen/rejected, loss = hard_dpo_loss.
+          "simpo" — train chosen/rejected with reference-free SimPO loss over length-normalized log-probs.
           "soft" — train resp1, resp2, p, p_bayes; val chosen/rejected; train loss = soft_dpo_classic_loss(use_bayes=False).
           "bayes" — like soft, train loss = soft_dpo_classic_loss(use_bayes=True).
 
+    simpo_gamma: target margin γ in -log σ(βm - γ), used only when mode="simpo".
     epochs: planned epoch count (for λ and linear LR on scale 1..epochs). Training runs
         resume_start_epoch_1based, …, epochs (inclusive). Fresh start: resume_start_epoch_1based=1.
     val_ds is always chosen/rejected; validation uses hard DPO loss, NLL, accuracy.
@@ -1035,6 +1049,7 @@ def train_dpo(
     mlflow_param_dict: Dict[str, Any] = {
         "mode": mode,
         "beta": beta,
+        "simpo_gamma": simpo_gamma,
         "lr": lr,
         "batch_size": batch_size,
         "epochs": epochs,
@@ -1095,6 +1110,7 @@ def train_dpo(
             use_chat_template=use_chat_template,
             p_pred_target_temperature=p_pred_target_temperature,
             soft_loss_type=soft_loss_type,
+            simpo_gamma=simpo_gamma,
         )
 
         g = torch.Generator()
@@ -1624,7 +1640,7 @@ def train_dpo(
             return val_nll
 
         use_mid_epoch_val = (
-            mode != "hard"
+            mode in ("soft", "bayes")
             and epochs >= 2
             and dataset_name in ULTRAFB_MID_EPOCH_DATASETS
         )
@@ -1695,7 +1711,7 @@ def train_dpo(
         loss_log = soft_loss_type if mode in ("soft", "bayes") else mode
         log_msg(
             f"train_dpo start: loss={loss_log}, epochs_total={epochs}, seed={seed}\n"
-            f"beta={beta}, lr={lr},\n"
+            f"beta={beta}, lr={lr}, simpo_gamma={simpo_gamma},\n"
             f"epochs_this_run={epochs - g0_start}, resume_start_epoch_1based={resume_start_epoch_1based}\n"
             f"lambda_min={lambda_min}, lambda_schedule={lambda_schedule}, lambda_full_epochs={lambda_full_epochs}, "
             f"p_pred_target_temperature={p_pred_target_temperature}, label_noise_prob={_lnp}\n"
@@ -1899,7 +1915,7 @@ def train_dpo(
         # Anchor mode: in a continuous run p_pred_teacher appears at end of epoch k (lambda_full_epochs).
         # Starting epoch (k+1) without that column — compute teacher from current weights (end of k), same as there.
         if (
-            mode != "hard"
+            mode in ("soft", "bayes")
             and lambda_full_epochs > 0
             and resume_start_epoch_1based == lambda_full_epochs + 1
             and "p_pred_teacher" not in train_ds.column_names
@@ -1955,7 +1971,7 @@ def train_dpo(
         for g0 in range(g0_start, epochs):
             log_msg("")
             log_msg(f"=== Epoch {g0 + 1}/{epochs} ===")
-            if mode == "hard":
+            if mode in ("hard", "simpo"):
                 epoch_loss_kw = dict(loss_kwargs)
                 mid_hook: Optional[Callable[[int], None]] = None
             else:
@@ -2087,7 +2103,7 @@ def train_dpo(
                 else:
                     train_loader_box = [train_loader]
 
-            if mode == "hard":
+            if mode in ("hard", "simpo"):
                 train_loader_box = [train_loader]
 
             if device.type == "cuda" and torch.cuda.is_available():
@@ -2112,7 +2128,7 @@ def train_dpo(
                 grad_clip_norm=grad_clip_norm,
                 log=log_msg,
                 use_mlflow=use_mlflow,
-                mid_epoch_hook=mid_hook if mode != "hard" else None,
+                mid_epoch_hook=mid_hook if mode in ("soft", "bayes") else None,
                 step_tracker=step_tracker if probe_margins else None,
                 after_step_hook=_maybe_probe_after_step if probe_margins else None,
             )
@@ -2127,7 +2143,7 @@ def train_dpo(
             # (batch count of the full dataset), unchanged by mid_hook.
 
             if (
-                mode != "hard"
+                mode in ("soft", "bayes")
                 and lambda_full_epochs > 0
                 and (g0 + 1) == lambda_full_epochs
             ):
